@@ -1,0 +1,16 @@
+# 本地运行产物（含会话 ID 与本机路径，禁止入库）
+.focus-guard/
+*.log
+
+# 本地部署辅助脚本（含本机绝对路径）
+deploy.mjs
+HANDOFF.md
+
+# 测试临时产物
+_guard_under_test.mjs
+_test.mjs
+
+# 环境与系统
+node_modules/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,76 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" start",
+            "timeoutMs": 10000,
+            "statusMessage": "聚焦护栏：注入会话约定"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" reset",
+            "timeoutMs": 10000,
+            "statusMessage": "聚焦护栏：重置回合预算"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" pre",
+            "timeoutMs": 10000,
+            "statusMessage": "聚焦护栏：熔断状态检查"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" post",
+            "timeoutMs": 10000,
+            "statusMessage": "聚焦护栏：检查回合预算"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" postfail",
+            "timeoutMs": 10000,
+            "statusMessage": "聚焦护栏：检查连续失败熔断"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.mjs\" stop",
+            "timeoutMs": 10000,
+            "statusMessage": "聚焦护栏：违禁语与熔断声明检查"
+          }
+        ]
+      }
+    ]
+  }
+}

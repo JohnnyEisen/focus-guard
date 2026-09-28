@@ -1,0 +1,8 @@
+{
+  "name": "focus-guard",
+  "version": "1.0.0",
+  "description": "AI履职执法模型v3.0+动态预算v1.0（全自动）：空气层零打扰不查词、行为触发五条、动态预算(关键词50/15/10+任务规模声明+自动续杯+硬上限200)+进度检测(有效/无效调用,连续3次停滞熔断,信用延期批示)、L1-L6梯度处罚、熔断期只读放行、体积刺客三闸、盲写拦截、抽查层、AUDIT.log全程留痕、授权识别核验、绝境模式特赦(仅认短指令明示授权)",
+  "author": { "name": "JohnnyEisen", "url": "https://github.com/JohnnyEisen" },
+  "skills": "./skills",
+  "hooks": "./hooks/hooks.json"
+}
