@@ -33,8 +33,9 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.0.1"; // 42条：部署版本核验基准
+const ENGINE_VERSION = "2.0.2"; // 42条：部署版本核验基准
 // 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
+// 2.0.2 DSH 版：csproj/sln 列入风险文件备案（C# 项目配置与 package.json 同级）
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -58,7 +59,7 @@ const PARDON_BASIS_RE = /依据[:：]\s*【?([^】\n，。；]{2,50})/;
 const AUTH_SEMANTICS_RE = /授权|特赦|赦免|批准|允许|豁免|跳过|绕过|无需|不用|猜测/;
 const DOWNGRADE_MARKERS = /最小复现|复现请求|排查实验|联网证据|外部搜寻|卡点记录|HANDOFF\.md|交接报告/i;
 const EVIDENCE_ANCHORS = /:\d+|日志原文|报错|HANDOFF\.md|交接报告|【假设】|【熔断】/;
-const RISKY_FILE_RE = /(^|\/)(package(-lock)?\.json|[^\/]*\.lock|tsconfig\.json|AGENTS\.md|CLAUDE\.md|Dockerfile|[^\/]*\.env[^\/]*|zcode\.json)$|\.github\/|\.zcode-plugin\//i;
+const RISKY_FILE_RE = /(^|\/)(package(-lock)?\.json|[^\/]*\.lock|tsconfig\.json|AGENTS\.md|CLAUDE\.md|Dockerfile|[^\/]*\.env[^\/]*|zcode\.json|[^\/]*\.csproj|[^\/]*\.sln)$|\.github\/|\.zcode-plugin\//i;
 const MUTATING_BASH_RE = /(^|[;&|]\s*)(rm|rmdir|mv|del|rd|git\s+(add|commit|push|pull|merge|rebase|reset|checkout|clean|restore)|npm\s+(install|uninstall|ci)|pip3?\s+(install|uninstall)|yarn\s+(add|remove|install)|pnpm\s+(add|remove|install)|chmod|chown|kill|taskkill|truncate|dd|mkfs|mkdir|touch|Set-Content|Add-Content|Remove-Item|New-Item|Copy-Item|Move-Item)\b/i;
 const FILE_REDIRECT_RE = /(^|\s)>{1,2}(?!\s*&)/;
 
@@ -534,6 +535,40 @@ if (mode === "start") {
       } catch {}
     }
   }
+  // 立法法·第七章 规则备案：生效规则集登记（名称/版本/生效时间）
+  audit(sid, "rules-registered", {
+    level: null,
+    evidence: `立法法(试行)v1.0 生效2026-09-29; 监督办法v1.0(docs/RULES.md); 引擎v${ENGINE_VERSION}`,
+  });
+  // 立法法·第七章 / 监督办法第九章 部署核验：注册表 ↔ 市场源 ↔ 运行引擎
+  try {
+    const home = process.env.USERPROFILE || process.env.HOME || "";
+    const reg = JSON.parse(
+      readFileSync(join(home, ".zcode", "cli", "plugins", "installed_plugins.json"), "utf8")
+    );
+    const entry = (reg.plugins || []).find((p) => String(p.id || "").startsWith("focus-guard"));
+    if (entry) {
+      const regVer = String(basename(String(entry.installPath || "")));
+      let srcVer = "";
+      try {
+        srcVer =
+          JSON.parse(
+            readFileSync(
+              join(home, ".zcode", "workspace", "default", "plugins", "focus-guard", "marketplace.json"),
+              "utf8"
+            )
+          ).version || "";
+      } catch {}
+      const drift = [];
+      if (regVer && regVer !== ENGINE_VERSION) drift.push(`注册表v${regVer}`);
+      if (srcVer && srcVer !== ENGINE_VERSION) drift.push(`市场源v${srcVer}`);
+      if (drift.length) {
+        ctx += `\n【部署版本核验·立法法第七章】运行引擎 v${ENGINE_VERSION} ≠ ${drift.join(" / ")}，规则体系存在部署漂移，请领导核验一致性。`;
+        audit(sid, "deploy-mismatch", { level: null, evidence: `立法法第七章 引擎v${ENGINE_VERSION} vs ${drift.join(" / ")}` });
+      }
+    }
+  } catch {}
+
   process.stdout.write(
     JSON.stringify({
       hookSpecificOutput: {

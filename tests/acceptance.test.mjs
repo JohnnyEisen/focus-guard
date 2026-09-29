@@ -495,3 +495,26 @@ describe("环境检测防误判（2.0.1）", () => {
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "grep -rn x . | head -5" } }).rc, 0);
   });
 });
+
+describe("DSH 版（v2.0.2，CS2 modding 适配）", () => {
+  test("csproj/sln 修改列入风险文件备案", () => {
+    const run = makeRunner("dsh-csproj");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "src/RailGuardLocaleSource.cs", limit: 5 }, tool_response: { content: "x" } }); // 先取证
+    run("pre", { tool_name: "Edit", tool_input: { file_path: "E:/x/RailCapacityGuard.csproj" } });
+    assert.ok(auditOf("dsh-csproj").includes("风险文件修改"));
+    run("pre", { tool_name: "Edit", tool_input: { file_path: "E:/x/Mod.sln" } });
+    assert.ok(auditOf("dsh-csproj").split("风险文件修改").length >= 3);
+  });
+
+  test("卷宗依赖声明在真实工作区生效（Game.dll 60天）", () => {
+    const run = makeRunner("dsh-case");
+    const dir = freshDir();
+    mkdirSync(join(dir, ".ai"), { recursive: true });
+    writeFileSync(join(dir, ".ai", "CASE_FILE.md"), `# 卷宗\n\n### 【二】项目依赖声明（人工填写，可覆盖自动 TTL）\n\n| 依赖名 | 版本 | 安装路径 | 更新频率 | 信任TTL | 备注 |\n|---|---|---|---|---|---|\n| 游戏本体 | 1.6.2f1 | D:/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed | 稳定拖沓 | 60天 | 测试 |\n\n### 【三】侦查取证记录（插件自动追加）\n\n| 文件名 | 读取时间 | mtime | size | SHA-256 | 变更历史 | TTL | 验证方式 |\n|---|---|---|---|---|---|---|---|\n`);
+    run("start", { session_id: "dsh-case" }, { ZCODE_PROJECT_DIR: dir });
+    const s = stateOf("dsh-case");
+    assert.equal(Object.keys(s.caseCache || {}).length, 0); // 空记录载入
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
