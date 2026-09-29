@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync, mkdirSync, utimesSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -16,15 +16,16 @@ function freshDir() {
 }
 function makeRunner(sid) {
   // 无 ZCODE_PROJECT_DIR → 审计日志退回系统临时目录，测试间相互隔离
-  return (mode, obj) => {
+  return (mode, obj, env) => {
     try {
-      return { rc: 0, out: execFileSync("node", [GUARD, mode], { input: JSON.stringify({ ...obj, session_id: `${obj.session_id || sid}-${RUN}` }), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim() };
+      return { rc: 0, out: execFileSync("node", [GUARD, mode], { input: JSON.stringify({ ...obj, session_id: `${obj.session_id || sid}-${RUN}` }), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...env } }).trim() };
     } catch (e) {
       return { rc: e.status, out: ((e.stderr || "") + (e.stdout || "")).trim() };
     }
   };
 }
 const stateOf = (sid) => JSON.parse(readFileSync(join(tmpdir(), `focus-guard-${sid}-${RUN}.json`), "utf8"));
+const auditOf = (sid) => readFileSync(join(tmpdir(), `focus-guard-${sid}-${RUN}-AUDIT.log`), "utf8");
 
 describe("动态预算", () => {
   test("批示关键词设定初始预算", () => {
@@ -42,10 +43,10 @@ describe("动态预算", () => {
     run("reset", { prompt: "看看情况" });
     let refills = 0;
     for (let i = 1; i <= 30; i++) {
-      const r = run("post", { tool_name: "Read", tool_input: { file_path: `f${i}.txt`, limit: 5 }, tool_response: { content: `v${i}` } });
+      const r = run("post", { tool_name: "Edit", tool_input: { file_path: `f${i}.txt`, old_string: "a", new_string: `b${i}` }, tool_response: { content: "ok" } });
       if (r.out.includes("续杯")) refills++;
     }
-    assert.equal(refills, 3); // 10/20/30 三次续杯
+    assert.equal(refills, 3); // 10/20/30 三次续杯（执行池）
     assert.equal(stateOf("longtask").taskBudget, 40);
     assert.equal(stateOf("longtask").fused, false);
   });
@@ -57,7 +58,7 @@ describe("动态预算", () => {
     const o = JSON.parse(readFileSync(sp, "utf8"));
     o.taskBudget = 200; o.effectiveCalls = 199;
     writeFileSync(sp, JSON.stringify(o));
-    const r = run("post", { tool_name: "Read", tool_input: { file_path: "h.txt", limit: 5 }, tool_response: { content: "新" } });
+    const r = run("post", { tool_name: "Edit", tool_input: { file_path: "h.txt", old_string: "a", new_string: "新" }, tool_response: { content: "新" } });
     assert.ok(r.out.includes("硬上限"));
     assert.equal(stateOf("hardcap").fused, true);
   });
@@ -147,5 +148,129 @@ describe("体积刺客", () => {
     assert.equal(r.rc, 2);
     assert.ok(r.out.includes("体积刺客"));
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("双预算池（20条）", () => {
+  test("侦查调用进侦查池，不挤占执行池", () => {
+    const run = makeRunner("dualpool");
+    run("reset", { prompt: "看看情况" });
+    for (let i = 1; i <= 5; i++) {
+      run("post", { tool_name: "Read", tool_input: { file_path: `r${i}.txt`, limit: 5 }, tool_response: { content: `v${i}` } });
+    }
+    let s = stateOf("dualpool");
+    assert.equal(s.invCalls, 5);
+    assert.equal(s.effectiveCalls, 0);
+    run("post", { tool_name: "Edit", tool_input: { file_path: "a.txt", old_string: "a", new_string: "b" }, tool_response: { content: "ok" } });
+    s = stateOf("dualpool");
+    assert.equal(s.effectiveCalls, 1);
+    assert.equal(s.invCalls, 5);
+  });
+
+  test("侦查池超限 → 提醒收敛；批示『追加额度』→ 双池+10", () => {
+    const run = makeRunner("invpool");
+    run("reset", { prompt: "看看情况" });
+    let warned = "";
+    for (let i = 1; i <= 16; i++) {
+      const r = run("post", { tool_name: "Read", tool_input: { file_path: `f${i}.txt`, limit: 5 }, tool_response: { content: `v${i}` } });
+      if (r.out.includes("侦查池")) warned = r.out;
+    }
+    assert.ok(warned.includes("侦查池"));
+    assert.equal(stateOf("invpool").invWarned, true);
+    run("reset", { prompt: "追加额度" });
+    const s = stateOf("invpool");
+    assert.equal(s.invCap, 25);
+    assert.equal(s.taskBudget, 20);
+    assert.equal(s.invWarned, false);
+  });
+});
+
+describe("缓存利用（49条）", () => {
+  test("同文件同 mtime 重复整读被拒；offset 续读放行；mtime 变更后放行", () => {
+    const run = makeRunner("mtime");
+    const dir = freshDir();
+    const f = join(dir, "doc.txt");
+    writeFileSync(f, "v1\n".repeat(10));
+    run("reset", { prompt: "看看情况" });
+    assert.equal(run("pre", { tool_name: "Read", tool_input: { file_path: f, limit: 5 } }).rc, 0); // 首读放行
+    run("post", { tool_name: "Read", tool_input: { file_path: f, limit: 5 }, tool_response: { content: "v1" } }); // 记录 mtime
+    const dup = run("pre", { tool_name: "Read", tool_input: { file_path: f } });
+    assert.equal(dup.rc, 2);
+    assert.ok(dup.out.includes("重复整读"));
+    assert.equal(run("pre", { tool_name: "Read", tool_input: { file_path: f, offset: 5 } }).rc, 0); // 增量读放行
+    const t = new Date(Date.now() + 5000);
+    utimesSync(f, t, t);
+    assert.equal(run("pre", { tool_name: "Read", tool_input: { file_path: f } }).rc, 0); // mtime 变更放行
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("上下文污染检测（58条）", () => {
+  test("head 承诺 N 行实际超出 → 拦截并要求隔离核实", () => {
+    const run = makeRunner("pollute");
+    run("reset", { prompt: "看看情况" });
+    const r = run("post", {
+      tool_name: "Bash",
+      tool_input: { command: "git ls-files | head -3" },
+      tool_response: { content: "a.js\nb.js\nc.js\nd.js\ne.js" },
+    });
+    assert.ok(r.out.includes("上下文污染"));
+    assert.ok(r.out.includes("MARK-X"));
+  });
+
+  test("head N 行内正常输出放行", () => {
+    const run = makeRunner("cleanout");
+    run("reset", { prompt: "看看情况" });
+    const r = run("post", { tool_name: "Bash", tool_input: { command: "git ls-files | head -3" }, tool_response: { content: "a.js\nb.js\nc.js" } });
+    assert.equal(r.out, "");
+  });
+
+  test("清单输出出现重复路径 → 拦截", () => {
+    const run = makeRunner("duppath");
+    run("reset", { prompt: "看看情况" });
+    const r = run("post", {
+      tool_name: "Bash",
+      tool_input: { command: "find . -name '*.js'" },
+      tool_response: { content: "./x/a.js\n./x/b.js\n./x/a.js" },
+    });
+    assert.ok(r.out.includes("上下文污染"));
+  });
+});
+
+describe("回合与部署卫生", () => {
+  test("43条 残留核验：上一回合残留被记档后清理", () => {
+    const run = makeRunner("residue");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } }); // turnCount=1, readSet=1
+    run("reset", { prompt: "新任务" });
+    assert.ok(auditOf("residue").includes("residue-check"));
+    assert.equal(stateOf("residue").turnCount, 0);
+  });
+
+  test("36条 交叉巡视：存在 HANDOFF.md 时注入提醒", () => {
+    const run = makeRunner("handover");
+    const dir = freshDir();
+    writeFileSync(join(dir, "HANDOFF.md"), "# handoff");
+    const r = run("start", { session_id: "handover" }, { ZCODE_PROJECT_DIR: dir });
+    assert.ok(r.out.includes("异地交叉巡视"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("42条 版本核验：源码版本不一致时告警", () => {
+    const run = makeRunner("vercheck");
+    const dir = freshDir();
+    mkdirSync(join(dir, "focus-guard", "hooks"), { recursive: true });
+    writeFileSync(join(dir, "focus-guard", "hooks", "guard.mjs"), "// focus-guard 护栏脚本 v9.9.9 — test\n");
+    const r = run("start", { session_id: "vercheck" }, { ZCODE_PROJECT_DIR: dir });
+    assert.ok(r.out.includes("部署版本核验"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("48条 子代理留痕：携带父会话处分状态", () => {
+    const run = makeRunner("subagent");
+    run("reset", { prompt: "看看情况" });
+    run("pre", { tool_name: "Agent", tool_input: { description: "探查", prompt: "p" } });
+    assert.ok(auditOf("subagent").includes("subagent-spawn"));
+    assert.ok(auditOf("subagent").includes("fused=false"));
   });
 });

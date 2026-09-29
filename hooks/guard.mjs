@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// focus-guard 护栏脚本 v1.0.0 — 《AI 履职执法模型 v3.0》+ 动态预算与进度检测系统
+// focus-guard 护栏脚本 v1.1.0 — 《AI 履职执法模型 v3.0》+ 动态预算与进度检测系统
+// v1.1.0 新增编译：双预算池(20条)/mtime缓存闸(49条)/上下文污染检测(58条)/残留核验(43条)/异地交叉巡视(36条)/部署版本核验(42条)/子代理状态留痕(48条)/追加批示(24条三)
 // 一、空气层：不查词、不打扰（违禁词扫描已废除）
 // 二、触发层：行为违规即罚，梯度处罚 L1-L6；触发④已升级为动态预算+进度检测
 // 三、抽查层：盲写检测 / 风险文件 100% 留痕 / 每 5 次写操作随机全量审计
@@ -24,6 +25,8 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
+const ENGINE_VERSION = "1.1.0"; // 42条：部署版本核验基准
+const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const FUSE_PHRASE = "【熔断】无法通过现有资料定位核心问题";
 const MERCY_RE = /允许基于有限信息(进行)?猜测|(开启|启动|进入|批准|授予)绝境模式|【特赦】|(^|[\s，。！？,!?])特赦(?=$|[\s，。！？,!?])/;
 const CREDIT_RE = /继续|放行|延长/; // 信用延期批复（短指令）
@@ -56,7 +59,8 @@ const SESSION_RULES =
   "②本回合调用≥5次后收尾无证据锚点([文件:行号]/[日志原文]/工具结果)且未标【假设】 " +
   "③整读>50KB大文件、Grep content无head_limit、裸cat/type刷屏 ④动态预算超限(见下) ⑤查无实据仍硬凑不熔断。" +
   "【动态预算】任务预算按批示关键词设定(审计/红队/重构/全量/批量/探索/遍历/升级/补丁=50，修复/添加/修改/重命名/删除=15，其他=10)；" +
-  "首轮回复可声明【任务规模】预计调用X次上调；有效调用满阈值自动续杯+10；硬上限200次达到即熔断。" +
+  "首轮回复可声明【任务规模】预计调用X次上调；执行池满阈值自动续杯+10；硬上限200次达到即熔断。" +
+  "【双预算池】侦查(只读)与执行(Write/Edit/变更命令)分池计数，不互相挤占：执行池=任务预算+续杯，侦查池独立15次；侦查超限提醒收敛，短指令『追加额度』→双池+10；同文件同mtime重复整读被拒(49条)。" +
   "【进度检测】有效调用=返回内容有变化/产生文件变更/出现新报错；连续3次无效调用(重复读同一内容/同命令同返回/无新增证据)=真失控→L3熔断；" +
   "停滞2次护栏预警，可结束回合输出【信用延期】请批示(回复 继续/放行/延长→+10次，回复 熔断/停→立即熔断)。" +
   "【梯度处罚】L1打回重写→L2强制取证→L3熔断(只读调查仍放行，改动类全拒)→L4记档→L5降权→L6上报；人类新指令=批示，全部解除。" +
@@ -145,6 +149,10 @@ function loadState(path) {
       lastSig: "",
       lastInput: "",
       totalCalls: 0,
+      invCalls: 0,
+      invCap: INV_POOL_DEFAULT,
+      invWarned: false,
+      mtimeSet: {},
     };
   }
 }
@@ -231,11 +239,32 @@ const path = statePath(sid);
 
 if (mode === "start") {
   rmSync(path, { force: true });
+  let ctx = SESSION_RULES;
+  const projDir = process.env.ZCODE_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || "";
+  if (projDir) {
+    // 36条 异地交叉巡视：新会话接手 → 复核前任结论
+    try {
+      readFileSync(join(projDir, "HANDOFF.md"), "utf8");
+      ctx += "\n【异地交叉巡视·36条】检测到 HANDOFF.md：本会话接手前任任务，先读 HANDOFF.md 复核前任结论；未证实内容一律标【假设】。";
+      audit(sid, "handover-inspect", { level: null, evidence: "36条 交叉巡视：发现 HANDOFF.md" });
+    } catch {}
+    // 42条 部署版本核验：运行引擎 vs 工作区源码
+    for (const rel of ["focus-guard/hooks/guard.mjs", "plugins/focus-guard/hooks/guard.mjs"]) {
+      try {
+        const m = readFileSync(join(projDir, rel), "utf8").slice(0, 400).match(/v(\d+\.\d+\.\d+)/);
+        if (m && m[1] !== ENGINE_VERSION) {
+          ctx += `\n【部署版本核验·42条】运行引擎 v${ENGINE_VERSION} ≠ 工作区源码 v${m[1]}（${rel}），疑似升级后未同步部署，请核验一致性。`;
+          audit(sid, "version-check", { level: null, evidence: `42条 引擎 v${ENGINE_VERSION} vs 源码 v${m[1]} (${rel})` });
+        }
+        break;
+      } catch {}
+    }
+  }
   process.stdout.write(
     JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "SessionStart",
-        additionalContext: SESSION_RULES,
+        additionalContext: ctx,
       },
     })
   );
@@ -260,14 +289,35 @@ if (mode === "reset") {
   if (short.length <= 12 && (state.stalledStreak || 0) >= 2 && CREDIT_RE.test(short)) {
     state.stalledStreak = 0;
     state.taskBudget = Math.min((state.taskBudget || BUDGET_DEFAULT) + REFILL, BUDGET_CAP);
+    state.invCap = Math.min((state.invCap || INV_POOL_DEFAULT) + REFILL, BUDGET_CAP); // 20条：侦查池同步追加
+    state.invWarned = false;
     creditGranted = true;
     audit(sid, "budget-extend", { level: null, evidence: `信用延期获批 budget=${state.taskBudget} eff=${state.effectiveCalls || 0} stall=0` });
   }
-  if (short.length <= 12 && STOP_ORDER_RE.test(short)) {
+  const stopOrdered = short.length <= 12 && STOP_ORDER_RE.test(short);
+  if (stopOrdered) {
     state.fused = true;
     state.violations = Math.max(state.violations || 0, 3);
     audit(sid, "stall-fuse", { level: 3, evidence: "人类批示停止" });
   }
+
+  // 24条(三) 追加批示：明示追加 → 双池+10
+  if (short.length <= 12 && /追加|增加额度|扩大额度/.test(short)) {
+    state.taskBudget = Math.min((state.taskBudget || BUDGET_DEFAULT) + REFILL, BUDGET_CAP);
+    state.invCap = Math.min((state.invCap || INV_POOL_DEFAULT) + REFILL, BUDGET_CAP);
+    state.invWarned = false;
+    audit(sid, "budget-extend", { level: null, evidence: `24条(三) 追加批示 budget=${state.taskBudget} invCap=${state.invCap}` });
+  }
+
+  // 43条 状态重置核验：上一回合残留 → 记档报告后清理（本事件随后统一重置）
+  const residues = [];
+  if ((state.turnCount || 0) > 0) residues.push(`turnCount=${state.turnCount}`);
+  if ((state.stalledStreak || 0) > 0) residues.push(`stall=${state.stalledStreak}`);
+  if (state.fused && !stopOrdered) residues.push("fused");
+  if (state.forcedInvestigate) residues.push("forcedInvestigate");
+  if (state.stopBlocked) residues.push("stopBlocked");
+  if (state.readSet && Object.keys(state.readSet).length) residues.push(`readSet=${Object.keys(state.readSet).length}`);
+  if (residues.length) audit(sid, "residue-check", { level: null, evidence: `43条 残留(已清理): ${residues.join(" ")}` });
 
   const kw = KEY50_RE.test(promptText) ? 50 : KEY15_RE.test(promptText) ? 15 : BUDGET_DEFAULT;
   state.keywordBudget = kw;
@@ -284,6 +334,7 @@ if (mode === "reset") {
     forcedInvestigate: false,
     probation: false,
     readSet: {},
+    mtimeSet: {},
     turnPrompt: promptText.slice(0, 500),
     taskBudget: state.taskBudget,
     keywordBudget: kw,
@@ -304,7 +355,11 @@ if (mode === "pre") {
   const search = /^(WebSearch|WebFetch)$/.test(tool) || /mcp__.*(web|search)/i.test(tool);
 
   if (tool === "Agent") {
-    audit(sid, "subagent-spawn", { level: null, evidence: String(ti.description || ti.prompt || "").slice(0, 80) });
+    // 48条 子代理继承留痕：父会话处分状态随派单记录（平台无注入通道，以留痕方式移交）
+    audit(sid, "subagent-spawn", {
+      level: null,
+      evidence: `48条 父状态 fused=${!!state.fused} L${state.violations || 0} eff=${state.effectiveCalls || 0} inv=${state.invCalls || 0} | ${String(ti.description || ti.prompt || "").slice(0, 60)}`,
+    });
   }
 
   // 触发⑤：熔断期白名单——只读调查类 + 降级动作放行，改动类拒绝（L3 放行只读工具）
@@ -360,6 +415,22 @@ if (mode === "pre") {
         );
         process.exit(2);
       }
+    }
+  }
+
+  // 49条 缓存利用：同文件同 mtime 重复整读 → 拒绝（offset 增量读放行）
+  if (tool === "Read" && !ti.offset && rawPath) {
+    const prevMtime = (state.mtimeSet || {})[filePath];
+    if (prevMtime !== undefined) {
+      try {
+        if (statSync(rawPath).mtimeMs === prevMtime) {
+          audit(sid, "cache-dup-read", { level: null, evidence: `49条 重复整读 ${filePath}` });
+          process.stderr.write(
+            `[49条·缓存利用]${filePath} 本回合已读过且文件未变更（mtime 一致），同文件同 mtime 重复整读被拒。改用 offset 续读未读区段、Grep 定位行号，或直接复用已有结论。`
+          );
+          process.exit(2);
+        }
+      } catch {}
     }
   }
 
@@ -426,6 +497,13 @@ if (mode === "post" || mode === "postfail") {
     state.readSet = state.readSet || {};
     if (ti.file_path && ["Read", "Write", "Edit"].includes(tool)) state.readSet[normalize(ti.file_path)] = 1;
     if (tool === "Grep" && typeof ti.path === "string") state.readSet[normalize(ti.path)] = 1;
+    // 49条：记录成功 Read 的 mtime，供 pre 阶段同 mtime 重复整读拦截
+    if (tool === "Read" && ti.file_path) {
+      try {
+        state.mtimeSet = state.mtimeSet || {};
+        state.mtimeSet[normalize(ti.file_path)] = statSync(ti.file_path).mtimeMs;
+      } catch {}
+    }
   }
 
   // ===== 动态预算：进度检测引擎（v1.0.0 核心）=====
@@ -443,8 +521,11 @@ if (mode === "post" || mode === "postfail") {
     state.lastInput = inputSig;
   }
 
+  const inv = isInvestigation(tool, ti);
   if (progress) {
-    state.effectiveCalls = (state.effectiveCalls || 0) + 1;
+    // 20条 双预算池：侦查(只读)与执行(改动)分池计数，不互相挤占
+    if (inv) state.invCalls = (state.invCalls || 0) + 1;
+    else state.effectiveCalls = (state.effectiveCalls || 0) + 1;
     state.stalledStreak = 0;
     if ((state.effectiveCalls || 0) >= BUDGET_CAP) {
       state.fused = true;
@@ -454,7 +535,12 @@ if (mode === "post" || mode === "postfail") {
     } else if ((state.effectiveCalls || 0) >= (state.taskBudget || BUDGET_DEFAULT)) {
       state.taskBudget = Math.min((state.taskBudget || BUDGET_DEFAULT) + REFILL, BUDGET_CAP);
       audit(sid, "budget-extend", { level: null, evidence: `自动续杯 budget=${state.taskBudget} eff=${state.effectiveCalls} stall=0` });
-      reason = `[触发④]动态预算续杯：有效调用 ${state.effectiveCalls} 次已达阈值，预算自动 +${REFILL} → ${state.taskBudget}（硬上限 ${BUDGET_CAP}）。任务继续，但请自查：核心问题是否已在收敛？`;
+      reason = `[触发④]动态预算续杯：执行池有效调用 ${state.effectiveCalls} 次已达阈值，预算自动 +${REFILL} → ${state.taskBudget}（硬上限 ${BUDGET_CAP}）。任务继续，但请自查：核心问题是否已在收敛？`;
+    }
+    if (inv && !state.invWarned && (state.invCalls || 0) > (state.invCap || INV_POOL_DEFAULT)) {
+      state.invWarned = true;
+      audit(sid, "inv-pool-exceeded", { level: null, evidence: `20条 侦查池超限 inv=${state.invCalls}/${state.invCap || INV_POOL_DEFAULT}` });
+      reason = `[20条·双预算池]侦查池（独立 ${state.invCap || INV_POOL_DEFAULT} 次）已超限。侦查与执行不互相挤占，但能耗双控要求收敛：汇总已有证据向人类请示追加（短指令『追加额度』→ 双池+10），或交子代理摘要压缩侦查成本。`;
     }
   } else {
     state.stalledStreak = (state.stalledStreak || 0) + 1;
@@ -468,6 +554,34 @@ if (mode === "post" || mode === "postfail") {
       audit(sid, "stall-warning", { level: null, evidence: `停滞 ${state.stalledStreak} 次 eff=${state.effectiveCalls || 0}` });
       reason = `[触发④]停滞预警：已连续 ${state.stalledStreak} 次无效调用，再有一次即 L3 熔断。` +
         `换一种有证据依据的方法，或结束回合输出【信用延期】请人类批示（回复 继续/放行/延长 → 预算+10；回复 熔断/停 → 立即熔断）。`;
+    }
+  }
+
+  // 58条 上下文污染检测：工具输出与指令矛盾 → 停止使用该输出并报告人类
+  if (!reason && mode === "post" && tool === "Bash") {
+    const cmd = String(ti.command || "");
+    const probeOut = { parts: [], total: 0 };
+    collectStrings(input.tool_response ?? {}, probeOut, 100000);
+    const outLines = probeOut.parts.join("\n").split("\n").filter((l) => l.trim() !== "");
+    const hm = cmd.match(/\bhead\s+(?:-n\s*(\d{1,6})|-(\d{1,6}))\b/);
+    if (hm) {
+      const n = parseInt(hm[1] || hm[2], 10);
+      if (n > 0 && outLines.length > n) {
+        audit(sid, "ctx-pollution", { level: null, evidence: `58条 行数超限 head ${n} → 实际 ${outLines.length} 行 | ${cmd.slice(0, 60)}` });
+        reason = `[38条·上下文污染]工具输出与指令矛盾：命令承诺 head ${n} 行，实际返回 ${outLines.length} 行。立即停止使用本次输出，不基于不可信输出继续工作；用带标记的小命令（echo MARK-X）隔离核实，并向人类报告此异常。`;
+      }
+    }
+    if (!reason && /\b(find|git\s+(ls-files|ls-tree))\b/.test(cmd)) {
+      const seen = new Set();
+      let dup = "";
+      for (const l of outLines) {
+        if (seen.has(l)) { dup = l; break; }
+        if (/[\/\\]/.test(l)) seen.add(l);
+      }
+      if (dup) {
+        audit(sid, "ctx-pollution", { level: null, evidence: `58条 路径重复 ${dup.slice(0, 80)} | ${cmd.slice(0, 50)}` });
+        reason = `[38条·上下文污染]清单类输出出现不可能的重复路径（${dup.slice(0, 60)}）。立即停止使用本次输出，不基于不可信输出继续工作；用带标记的小命令（echo MARK-X）隔离核实，并向人类报告此异常。`;
+      }
     }
   }
 
@@ -641,6 +755,7 @@ if (mode === "stop") {
 
   state.stopBlocked = false;
   state.turnCount = 0;
+  state.mtimeSet = {}; // 49条：mtime 记录按回合失效（reset 为兜底）
   saveState(path, state);
   // 回合诊断：与 reset-fired 对照，定位 UserPromptSubmit 是否触发
   audit(sid, "stop-fired", { level: null, evidence: `turnCalls=${input && input.stop_hook_active !== undefined ? "有" : "?"} eff=${state.effectiveCalls || 0} budget=${state.taskBudget}` });
