@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { writeFileSync, readFileSync, rmSync, mkdirSync, utimesSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync, mkdirSync, utimesSync, statSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -16,16 +16,25 @@ function freshDir() {
 }
 function makeRunner(sid) {
   // 无 ZCODE_PROJECT_DIR → 审计日志退回系统临时目录，测试间相互隔离
-  return (mode, obj, env) => {
+  const run = (mode, obj, env) => {
     try {
       return { rc: 0, out: execFileSync("node", [GUARD, mode], { input: JSON.stringify({ ...obj, session_id: `${obj.session_id || sid}-${RUN}` }), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...env } }).trim() };
     } catch (e) {
       return { rc: e.status, out: ((e.stderr || "") + (e.stdout || "")).trim() };
     }
   };
+  // 绑定工作区：卷宗/审计落该目录（总纲二）
+  run.in = (dir) => (mode, obj) => run(mode, obj, { ZCODE_PROJECT_DIR: dir });
+  return run;
 }
 const stateOf = (sid) => JSON.parse(readFileSync(join(tmpdir(), `focus-guard-${sid}-${RUN}.json`), "utf8"));
 const auditOf = (sid) => readFileSync(join(tmpdir(), `focus-guard-${sid}-${RUN}-AUDIT.log`), "utf8");
+const writeState = (sid, patch) => {
+  const p = join(tmpdir(), `focus-guard-${sid}-${RUN}.json`);
+  const base = existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : {};
+  writeFileSync(p, JSON.stringify({ ...base, ...patch }));
+};
+const caseFileOf = (dir) => readFileSync(join(dir, ".ai", "CASE_FILE.md"), "utf8");
 
 describe("动态预算", () => {
   test("批示关键词设定初始预算", () => {
@@ -132,8 +141,8 @@ describe("履职纪律", () => {
     const run = makeRunner("mercy");
     run("reset", { prompt: "启动绝境模式" });
     assert.equal(stateOf("mercy").mercy, true);
-    run("reset", { prompt: "关于绝境模式的说明文档里提到启动绝境模式时应当如何如何的一大段协议引用文本超过三十个字符" });
-    assert.equal(stateOf("mercy").mercy, false);
+    run("reset", { session_id: "mercy-long", prompt: "关于绝境模式的说明文档里提到启动绝境模式时应当如何如何的一大段协议引用文本超过三十个字符" });
+    assert.equal(stateOf("mercy-long").mercy, false);
   });
 });
 
@@ -185,26 +194,6 @@ describe("双预算池（20条）", () => {
   });
 });
 
-describe("缓存利用（49条）", () => {
-  test("同文件同 mtime 重复整读被拒；offset 续读放行；mtime 变更后放行", () => {
-    const run = makeRunner("mtime");
-    const dir = freshDir();
-    const f = join(dir, "doc.txt");
-    writeFileSync(f, "v1\n".repeat(10));
-    run("reset", { prompt: "看看情况" });
-    assert.equal(run("pre", { tool_name: "Read", tool_input: { file_path: f, limit: 5 } }).rc, 0); // 首读放行
-    run("post", { tool_name: "Read", tool_input: { file_path: f, limit: 5 }, tool_response: { content: "v1" } }); // 记录 mtime
-    const dup = run("pre", { tool_name: "Read", tool_input: { file_path: f } });
-    assert.equal(dup.rc, 2);
-    assert.ok(dup.out.includes("重复整读"));
-    assert.equal(run("pre", { tool_name: "Read", tool_input: { file_path: f, offset: 5 } }).rc, 0); // 增量读放行
-    const t = new Date(Date.now() + 5000);
-    utimesSync(f, t, t);
-    assert.equal(run("pre", { tool_name: "Read", tool_input: { file_path: f } }).rc, 0); // mtime 变更放行
-    rmSync(dir, { recursive: true, force: true });
-  });
-});
-
 describe("上下文污染检测（58条）", () => {
   test("head 承诺 N 行实际超出 → 拦截并要求隔离核实", () => {
     const run = makeRunner("pollute");
@@ -241,7 +230,7 @@ describe("回合与部署卫生", () => {
   test("43条 残留核验：上一回合残留被记档后清理", () => {
     const run = makeRunner("residue");
     run("reset", { prompt: "看看情况" });
-    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } }); // turnCount=1, readSet=1
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
     run("reset", { prompt: "新任务" });
     assert.ok(auditOf("residue").includes("residue-check"));
     assert.equal(stateOf("residue").turnCount, 0);
@@ -272,5 +261,203 @@ describe("回合与部署卫生", () => {
     run("pre", { tool_name: "Agent", tool_input: { description: "探查", prompt: "p" } });
     assert.ok(auditOf("subagent").includes("subagent-spawn"));
     assert.ok(auditOf("subagent").includes("fused=false"));
+  });
+});
+
+describe("卷宗体系（总纲 2.0.0）", () => {
+  test("会话启动：环境检测一次写入 envCache，卷宗自动建立", () => {
+    const run = makeRunner("env-det");
+    const dir = freshDir();
+    run("start", { session_id: "env-det" }, { ZCODE_PROJECT_DIR: dir });
+    const s = stateOf("env-det");
+    assert.equal(s.envChecked, true);
+    assert.equal(s.envCache.os, process.platform);
+    assert.ok(s.envCache.shellIdKey);
+    assert.ok(existsSync(join(dir, ".ai", "CASE_FILE.md")));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("首次取证写入卷宗【三】侦查记录", () => {
+    const run = makeRunner("case-first");
+    const dir = freshDir();
+    const f = join(dir, "doc.txt");
+    writeFileSync(f, "v1\n".repeat(10));
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "v1" } });
+    const cf = caseFileOf(dir);
+    assert.ok(cf.includes("doc.txt"));
+    assert.ok(cf.includes("mtime+size+sha"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("跨回合指纹一致且 TTL 未超 → 免重读放行；offset 增量读永远放行", () => {
+    const run = makeRunner("case-dedup");
+    const dir = freshDir();
+    const f = join(dir, "doc.txt");
+    writeFileSync(f, "v1\n".repeat(10));
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    assert.equal(r("pre", { tool_name: "Read", tool_input: { file_path: f } }).rc, 0); // 首读
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "v1" } }); // 取证
+    r("reset", { prompt: "新回合" }); // 跨回合：侦查缓存保留
+    const dup = r("pre", { tool_name: "Read", tool_input: { file_path: f } });
+    assert.equal(dup.rc, 2);
+    assert.ok(dup.out.includes("免重读"));
+    assert.ok(dup.out.includes("卷宗"));
+    assert.equal(r("pre", { tool_name: "Read", tool_input: { file_path: f, offset: 5 } }).rc, 0); // 增量放行
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("内容变更 → 放行真重读并更新变更史", () => {
+    const run = makeRunner("case-change");
+    const dir = freshDir();
+    const f = join(dir, "doc.txt");
+    writeFileSync(f, "v1\n".repeat(10));
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "v1" } });
+    writeFileSync(f, "v2 totally different\n".repeat(10)); // mtime 变更
+    assert.equal(r("pre", { tool_name: "Read", tool_input: { file_path: f } }).rc, 0); // 指纹不一致 → 放行
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "v2" } });
+    assert.ok(caseFileOf(dir).match(/n=1; last=/)); // 变更史 +1
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("时间戳伪造（同 mtime 同 size 换内容）→ SHA-256 揭穿", () => {
+    const run = makeRunner("case-forge");
+    const dir = freshDir();
+    const f = join(dir, "doc.txt");
+    writeFileSync(f, "AAAAAAAA");
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "AAAAAAAA" } });
+    const rec = stateOf("case-forge").caseCache;
+    const key = Object.keys(rec).find((k) => k.endsWith("doc.txt"));
+    writeFileSync(f, "BBBBBBBB"); // 同 size=8
+    utimesSync(f, new Date(rec[key].mtime), new Date(rec[key].mtime)); // 伪造回原 mtime
+    const forge = r("pre", { tool_name: "Read", tool_input: { file_path: f } });
+    assert.equal(forge.rc, 0); // SHA 不一致 → 免读资格拦截，放行真重读
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("自适应 TTL 过期 → 放行真重读", () => {
+    const run = makeRunner("case-ttl");
+    const dir = freshDir();
+    const f = join(dir, "doc.txt");
+    writeFileSync(f, "stable");
+    const st = statSync(f);
+    const old = new Date(Date.now() - 25 * 3600e3).toISOString();
+    const lastCh = new Date(Date.now() - 8 * 86400e3).toISOString(); // 8天未变 → 自适应 24h
+    mkdirSync(join(dir, ".ai"), { recursive: true });
+    writeFileSync(
+      join(dir, ".ai", "CASE_FILE.md"),
+      `# 卷宗\n\n### 【三】侦查取证记录（插件自动追加）\n\n| 文件名 | 读取时间 | mtime | size | SHA-256 | 变更历史 | TTL | 验证方式 |\n|---|---|---|---|---|---|---|---|\n| ${f.replace(/\\/g, "/")} | ${old} | ${st.mtimeMs} | ${st.size} | - | n=1; last=${lastCh} | | mtime+size |\n`
+    );
+    const r = run.in(dir);
+    r("start", { session_id: "case-ttl" }, { ZCODE_PROJECT_DIR: dir }); // 重建 TTL 表
+    assert.equal(r("pre", { tool_name: "Read", tool_input: { file_path: f } }).rc, 0); // 超时 → 放行
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("项目依赖声明覆盖自适应 TTL（60天 > 40天前过期）", () => {
+    const run = makeRunner("case-dep");
+    const dir = freshDir();
+    const f = join(dir, "game-data.pak");
+    writeFileSync(f, "payload");
+    const st = statSync(f);
+    const old = new Date(Date.now() - 40 * 86400e3).toISOString();
+    mkdirSync(join(dir, ".ai"), { recursive: true });
+    writeFileSync(
+      join(dir, ".ai", "CASE_FILE.md"),
+      `# 卷宗\n\n### 【二】项目依赖声明（人工填写，可覆盖自动 TTL）\n\n| 依赖名 | 版本 | 安装路径 | 更新频率 | 信任TTL | 备注 |\n|---|---|---|---|---|---|\n| 游戏本体 | 1.6.2 | ${dir.replace(/\\/g, "/")} | 稳定拖沓 | 60天 | 测试 |\n\n### 【三】侦查取证记录（插件自动追加）\n\n| 文件名 | 读取时间 | mtime | size | SHA-256 | 变更历史 | TTL | 验证方式 |\n|---|---|---|---|---|---|---|---|\n| ${f.replace(/\\/g, "/")} | ${old} | ${st.mtimeMs} | ${st.size} | - | n=1; last=${old} | | mtime+size |\n`
+    );
+    const r = run.in(dir);
+    r("start", { session_id: "case-dep" }, { ZCODE_PROJECT_DIR: dir });
+    const dep = r("pre", { tool_name: "Read", tool_input: { file_path: f } });
+    assert.equal(dep.rc, 2); // 自适应已过期，但依赖声明 60 天仍有效 → 免重读
+    assert.ok(dep.out.includes("依赖声明"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("人工标注 TTL 覆盖（1分钟 标注 → 5分钟前取证已过期）", () => {
+    const run = makeRunner("case-manual");
+    const dir = freshDir();
+    const f = join(dir, "hot.txt");
+    writeFileSync(f, "hot");
+    const st = statSync(f);
+    const old = new Date(Date.now() - 5 * 60e3).toISOString();
+    mkdirSync(join(dir, ".ai"), { recursive: true });
+    writeFileSync(
+      join(dir, ".ai", "CASE_FILE.md"),
+      `# 卷宗\n\n### 【三】侦查取证记录（插件自动追加）\n\n| 文件名 | 读取时间 | mtime | size | SHA-256 | 变更历史 | TTL | 验证方式 |\n|---|---|---|---|---|---|---|---|\n| ${f.replace(/\\/g, "/")} | ${old} | ${st.mtimeMs} | ${st.size} | - | n=0; last=- | 1分钟 | mtime+size |\n`
+    );
+    const r = run.in(dir);
+    r("start", { session_id: "case-manual" }, { ZCODE_PROJECT_DIR: dir });
+    assert.equal(r("pre", { tool_name: "Read", tool_input: { file_path: f } }).rc, 0); // 人工标注 1分钟 已过
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("熔断期豁免免重读（降级重建证据需要真重读）", () => {
+    const run = makeRunner("case-fused");
+    const dir = freshDir();
+    const f = join(dir, "doc.txt");
+    writeFileSync(f, "v1");
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "v1" } });
+    writeState("case-fused", { fused: true });
+    assert.equal(r("pre", { tool_name: "Read", tool_input: { file_path: f } }).rc, 0); // 熔断期不拦免重读
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("工作额度台账落卷【四】", () => {
+    const run = makeRunner("case-ledger");
+    const dir = freshDir();
+    const r = run.in(dir);
+    r("reset", { prompt: "全量重构" });
+    r("post", { tool_name: "Edit", tool_input: { file_path: "a.txt", old_string: "a", new_string: "b" }, tool_response: { content: "ok" } });
+    r("post", { tool_name: "Read", tool_input: { file_path: "x.txt", limit: 5 }, tool_response: { content: "x" } });
+    r("stop", { response: "根据 a.txt:1 阶段完成" });
+    const cf = caseFileOf(dir);
+    assert.ok(cf.includes("### 【四】工作额度台账"));
+    const s = stateOf("case-ledger");
+    assert.ok(cf.includes(`| ${s.effectiveCalls} |`));
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("跨平台命令拦截（总纲六）", () => {
+  test("PowerShell 会话：禁 bash 管道与 &&", () => {
+    const run = makeRunner("plat-ps");
+    writeState("plat-ps", { envCache: { os: "win32", shellIdKey: "powershell" }, envChecked: true });
+    const p1 = run("pre", { tool_name: "Bash", tool_input: { command: "Get-Content x | head -5" } });
+    assert.equal(p1.rc, 2);
+    assert.ok(p1.out.includes("平台规则"));
+    const p2 = run("pre", { tool_name: "Bash", tool_input: { command: "git add . && git commit -m x" } });
+    assert.equal(p2.rc, 2);
+    const ok = run("pre", { tool_name: "Bash", tool_input: { command: "Get-Content x -TotalCount 5" } });
+    assert.equal(ok.rc, 0);
+  });
+
+  test("macOS 会话：禁 sed -i 无后缀 / grep -P / readlink -f", () => {
+    const run = makeRunner("plat-mac");
+    writeState("plat-mac", { envCache: { os: "darwin", shellIdKey: "bash" }, envChecked: true });
+    assert.ok(run("pre", { tool_name: "Bash", tool_input: { command: "sed -i s/a/b/ f.txt" } }).out.includes("sed -i"));
+    assert.ok(run("pre", { tool_name: "Bash", tool_input: { command: "grep -P '\\d' f.txt" } }).out.includes("-P"));
+    assert.ok(run("pre", { tool_name: "Bash", tool_input: { command: "readlink -f ./x" } }).out.includes("readlink"));
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "sed -i '' s/a/b/ f.txt" } }).rc, 0);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "grep -E '\\d' f.txt" } }).rc, 0);
+  });
+
+  test("大小写不敏感文件系统：禁仅大小写不同的重名文件", () => {
+    const run = makeRunner("plat-case");
+    const dir = freshDir();
+    writeFileSync(join(dir, "Readme.md"), "x");
+    writeState("plat-case", { envCache: { os: "darwin", shellIdKey: "zsh", caseSensitive: false }, envChecked: true });
+    const r = run("pre", { tool_name: "Write", tool_input: { file_path: join(dir, "readme.md") } });
+    assert.equal(r.rc, 2);
+    assert.ok(r.out.includes("大小写冲突"));
+    rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -1,23 +1,30 @@
 #!/usr/bin/env node
-// focus-guard 护栏脚本 v1.1.1 — 《AI 履职执法模型 v3.0》+ 动态预算与进度检测系统
-// v1.1.0 新增编译：双预算池(20条)/mtime缓存闸(49条)/上下文污染检测(58条)/残留核验(43条)/异地交叉巡视(36条)/部署版本核验(42条)/子代理状态留痕(48条)/追加批示(24条三)
-// v1.1.1 修法合规：SESSION_RULES 常驻注入压缩至 ≤500 字（编译指令第2条），细节回归钩子报文+focus-thinking 技能+docs/RULES.md
+// focus-guard 护栏脚本 v2.0.0 — 卷宗体系（总纲 2.0.0）+ 《AI 履职执法模型 v3.0》+ 动态预算
 // 一、空气层：不查词、不打扰（违禁词扫描已废除）
-// 二、触发层：行为违规即罚，梯度处罚 L1-L6；触发④已升级为动态预算+进度检测
-// 三、抽查层：盲写检测 / 风险文件 100% 留痕 / 每 5 次写操作随机全量审计
-// 四、留痕层：触发/处罚/抽查/特赦/预算伸缩/回合诊断 → <工作区>/.focus-guard/AUDIT.log (JSONL)
-// 关键设计：触发①②使用 turnCount（每回合由 Stop 事件清零）——实测 UserPromptSubmit reset
-// 不保证每次触发（AUDIT.log: 计数跨回合累计致任务中途撞 10 次硬熔断），故不再依赖 reset 做回合边界。
+// 二、触发层：行为违规即罚，梯度处罚 L1-L6；触发④=动态预算+进度检测；双预算池(20条)
+// 三、卷宗层(2.0)：.ai/CASE_FILE.md 四册（环境声明/依赖声明/侦查记录/额度台账）
+//     会话级环境检测一次全程复用（仅 shell 变化时重检）；跨回合取证指纹
+//     （mtime+size+SHA-256≤200KB+git 脏态）防伪；自适应 TTL+依赖声明/人工标注覆盖；
+//     指纹一致且 TTL 未超 → 免重读放行（拦截本次 Read，复用已有取证）
+// 四、平台层(2.0)：按检出 shell 适配命令规则（PS 禁 bash 管道 / macOS BSD 限制 / 大小写冲突拦截）
+// 五、抽查层：盲写检测 / 风险文件 100% 留痕 / 每 5 次写操作全量审计 / 上下文污染检测(58条)
+// 六、留痕层：执法 → <工作区>/.focus-guard/AUDIT.log (JSONL)；取证 → <工作区>/.ai/CASE_FILE.md
+// v2.0.0 破坏性变更：旧 mtime 逐回合闸(49条 per-turn)废弃，由卷宗指纹+TTL 体系替代（总纲：不写兼容层）
 // 模式:
-//   start    (SessionStart)        重置状态并注入执法模型
-//   reset    (UserPromptSubmit)    批示：关键词预算/信用延期批复/特赦识别；留痕 reset-fired（可能不触发，仅尽力）
-//   pre      (PreToolUse)          双规白名单(含只读放行) + 降权/强制取证 + 触发①③检查 + Agent 留痕
-//   post     (PostToolUse)         进度检测引擎(有效/无效、续杯、停滞熔断) + 巡检 + 抽查A
+//   start    (SessionStart)        环境检测 + 卷宗载入 + 注入执法模型
+//   reset    (UserPromptSubmit)    批示 + 重置任务态（保留侦查缓存）+ shell 变化重检
+//   pre      (PreToolUse)          平台规则 + 双规白名单 + 触发①③ + 盲写 + 卷宗免重读
+//   post     (PostToolUse)         进度检测引擎 + 卷宗取证记录 + 抽查 + 污染检测
 //   postfail (PostToolUseFailure)  失败=无进展，计入停滞
-//   stop     (Stop)                回合边界：清 turnCount + 任务规模/信用延期/授权识别核验 + 触发②⑤
-import { readFileSync, writeFileSync, rmSync, statSync, appendFileSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+//   stop     (Stop)                回合边界 + 锚点核验 + 额度台账落卷
+import {
+  readFileSync, writeFileSync, rmSync, statSync, appendFileSync,
+  mkdirSync, existsSync, renameSync, realpathSync, readdirSync,
+} from "node:fs";
+import { join, dirname, sep, basename } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 const OUTPUT_GATE_BYTES = 50 * 1024; // 触发③：体积闸值
 const RANDOM_AUDIT_EVERY = 5; // 抽查A：每 N 次写操作全量审计 1 次
@@ -26,8 +33,15 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "1.1.1"; // 42条：部署版本核验基准
+const ENGINE_VERSION = "2.0.0"; // 42条：部署版本核验基准
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
+const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
+const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
+const TTL_FIRST = 4 * 3600e3; // 自适应：首次 4h
+const TTL_RECENT = 2 * 3600e3; // 自适应：7天内有变 2h
+const TTL_WEEK = 24 * 3600e3; // 自适应：7-30天未变 24h
+const TTL_STABLE = 7 * 86400e3; // 自适应：30天未变 7天
+
 const FUSE_PHRASE = "【熔断】无法通过现有资料定位核心问题";
 const MERCY_RE = /允许基于有限信息(进行)?猜测|(开启|启动|进入|批准|授予)绝境模式|【特赦】|(^|[\s，。！？,!?])特赦(?=$|[\s，。！？,!?])/;
 const CREDIT_RE = /继续|放行|延长/; // 信用延期批复（短指令）
@@ -118,6 +132,16 @@ function audit(sid, trigger, opts = {}) {
   } catch {}
 }
 
+function projectDir() {
+  const d = process.env.ZCODE_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || "";
+  if (!d) return null;
+  try {
+    return statSync(d).isDirectory() ? d : null;
+  } catch {
+    return null;
+  }
+}
+
 function loadState(path) {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
@@ -139,6 +163,7 @@ function loadState(path) {
       keywordBudget: BUDGET_DEFAULT,
       declaredBudget: 0,
       effectiveCalls: 0,
+      ineffCalls: 0,
       stalledStreak: 0,
       lastSig: "",
       lastInput: "",
@@ -146,7 +171,10 @@ function loadState(path) {
       invCalls: 0,
       invCap: INV_POOL_DEFAULT,
       invWarned: false,
-      mtimeSet: {},
+      envCache: null,
+      envChecked: false,
+      caseCache: {},
+      taskInitial: BUDGET_DEFAULT,
     };
   }
 }
@@ -157,6 +185,243 @@ function saveState(path, state) {
 
 function normalize(p) {
   return String(p || "").replace(/\\/g, "/");
+}
+
+// ============ 2.0 环境检测（总纲三：会话级一次，全程复用） ============
+
+function quickShellId() {
+  if (process.platform === "win32") {
+    const sh = String(process.env.SHELL || "");
+    if (/bash|zsh|sh\b/i.test(sh)) return "bash";
+    if (process.env.PSModulePath) return "powershell";
+    return String(process.env.ComSpec || "").toLowerCase().includes("cmd") ? "cmd" : "unknown";
+  }
+  return String(process.env.SHELL || "sh").split(/[\\/]/).pop() || "sh";
+}
+
+function detectEnv() {
+  const osName = process.platform;
+  const shellIdKey = quickShellId();
+  let shellVersion = "";
+  try {
+    if (shellIdKey === "powershell")
+      shellVersion = execFileSync("powershell", ["-NoProfile", "-c", "$PSVersionTable.PSVersion.ToString()"], { encoding: "utf8", timeout: 6000 }).trim();
+    else if (shellIdKey === "zsh")
+      shellVersion = (execFileSync("zsh", ["--version"], { encoding: "utf8", timeout: 6000 }).match(/(\S+)\s*$/) || [])[1] || "";
+    else if (shellIdKey === "bash")
+      shellVersion = (execFileSync("bash", ["--version"], { encoding: "utf8", timeout: 6000 }).match(/version\s+(\S+)/) || [])[1] || "";
+  } catch {}
+  let encoding = "UTF-8";
+  if (osName === "win32") {
+    try {
+      const cp = execFileSync("cmd", ["/c", "chcp"], { encoding: "utf8", timeout: 6000 }).match(/(\d+)\s*$/);
+      encoding = cp ? (cp[1] === "65001" ? "UTF-8" : cp[1] === "936" ? "GBK" : "CP" + cp[1]) : "unknown";
+    } catch {}
+  }
+  // 大小写敏感：realpath 返回的盘上真实大小写与请求不同（仅大小写差异）→ 不敏感
+  let caseSensitive = osName !== "win32";
+  try {
+    const probeDir = projectDir() || process.cwd();
+    const real = realpathSync.native(probeDir);
+    if (real !== String(probeDir) && real.toLowerCase() === String(probeDir).toLowerCase()) caseSensitive = false;
+  } catch {}
+  const bsd = osName === "darwin"; // darwin 的 sed/grep/awk 为 BSD 版
+  const cmds = {};
+  const dirs = String(process.env.PATH || "").split(process.platform === "win32" ? ";" : ":").filter(Boolean);
+  for (const name of ["grep", "sed", "awk", "gsed", "greadlink"]) {
+    cmds[name] = dirs.some((d) => {
+      try {
+        return statSync(join(d, name + (osName === "win32" ? ".exe" : ""))).isFile();
+      } catch {
+        return false;
+      }
+    });
+  }
+  return {
+    os: osName,
+    shellIdKey,
+    shell: shellIdKey + (shellVersion ? " " + shellVersion : ""),
+    encoding,
+    pathSep: sep,
+    caseSensitive,
+    bsd,
+    cmds,
+    detectedAt: new Date().toISOString(),
+  };
+}
+
+// ============ 2.0 卷宗（总纲二：.ai/CASE_FILE.md 四册） ============
+
+const CASE_TEMPLATE =
+  "# FocusGuard 卷宗（CASE_FILE）\n\n" +
+  "> 引擎自动维护【三】【四】；【二】由人工填写。请勿手工重排结构。【三】TTL 列留空=自适应，人工填写（如 30天/1小时）=覆盖。\n\n" +
+  "### 【一】环境声明（会话启动检测，全程复用）\n\n（引擎留存于会话 state.envCache，此处不展开）\n\n" +
+  "### 【二】项目依赖声明（人工填写，可覆盖自动 TTL）\n\n" +
+  "| 依赖名 | 版本 | 安装路径 | 更新频率 | 信任TTL | 备注 |\n|---|---|---|---|---|---|\n\n" +
+  "### 【三】侦查取证记录（插件自动追加）\n\n" +
+  "| 文件名 | 读取时间 | mtime | size | SHA-256 | 变更历史 | TTL | 验证方式 |\n|---|---|---|---|---|---|---|---|\n\n" +
+  "### 【四】工作额度台账\n\n" +
+  "| 任务 | 初始额度 | 已用额度 | 剩余额度 | 有效调用 | 无效调用 | 更新时间 |\n|---|---|---|---|---|---|---|\n";
+
+function casePath(projDir) {
+  return join(projDir, ".ai", "CASE_FILE.md");
+}
+
+function ensureCaseFile(projDir) {
+  const p = casePath(projDir);
+  if (!existsSync(p)) {
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, CASE_TEMPLATE);
+  }
+  return p;
+}
+
+function sectionOf(text, marker) {
+  const re = new RegExp("### " + marker + "[\\s\\S]*?(?=\\n### |\\n## |$)");
+  return (text.match(re) || [""])[0];
+}
+
+function parseDur(s) {
+  const m = String(s || "").trim().match(/^(\d+(?:\.\d+)?)\s*(分钟|小时|天|h|d|H|D)?$/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  const u = m[2] || "小时";
+  if (u === "分钟") return n * 60e3;
+  if (u === "天" || u === "d" || u === "D") return n * 86400e3;
+  return n * 3600e3;
+}
+
+function loadCaseRecords(p) {
+  const out = {};
+  try {
+    const t = readFileSync(p, "utf8");
+    for (const line of sectionOf(t, "【三】").split("\n")) {
+      if (!line.startsWith("|")) continue;
+      const c = line.split("|").map((x) => x.trim());
+      if (c.length < 9) continue;
+      const [, f, readAt, mtime, size, sha, hist, ttl, via] = c;
+      if (!f || f === "文件名" || /^-+$/.test(f)) continue;
+      const hm = String(hist || "").match(/n=(\d+);?\s*last=(\S+)/);
+      out[normalize(f)] = {
+        path: f,
+        readAt: Date.parse(readAt) || 0,
+        mtime: parseFloat(mtime) || 0,
+        size: parseInt(size, 10) || 0,
+        sha: sha && sha !== "-" ? sha : "",
+        changes: hm ? parseInt(hm[1], 10) || 0 : 0,
+        lastChange: hm && hm[2] && hm[2] !== "-" ? Date.parse(hm[2]) || 0 : 0,
+        ttlOverride: ttl || "",
+        via: via || "mtime+size",
+      };
+    }
+  } catch {}
+  return out;
+}
+
+function saveCaseRecords(projDir, records) {
+  try {
+    const p = ensureCaseFile(projDir);
+    let t = readFileSync(p, "utf8");
+    const rows = Object.values(records)
+      .sort((a, b) => (b.readAt || 0) - (a.readAt || 0))
+      .slice(0, CASE_MAX_ROWS);
+    const table = ["| 文件名 | 读取时间 | mtime | size | SHA-256 | 变更历史 | TTL | 验证方式 |", "|---|---|---|---|---|---|---|---|"]
+      .concat(
+        rows.map(
+          (r) =>
+            `| ${r.path} | ${new Date(r.readAt || Date.now()).toISOString()} | ${r.mtime} | ${r.size} | ${r.sha || "-"} | n=${r.changes || 0}; last=${r.lastChange ? new Date(r.lastChange).toISOString() : "-"} | ${r.ttlOverride || ""} | ${r.via || "mtime+size"} |`
+        )
+      )
+      .join("\n");
+    t = t.replace(/(### 【三】[\s\S]*?\n)\| 文件名 \|[\s\S]*?(?=\n### |\n## |$)/, (_m, head) => head + table + "\n");
+    const tmp = p + ".tmp";
+    writeFileSync(tmp, t);
+    renameSync(tmp, p);
+  } catch {}
+}
+
+function saveLedger(projDir, state) {
+  try {
+    const p = ensureCaseFile(projDir);
+    let t = readFileSync(p, "utf8");
+    const eff = state.effectiveCalls || 0;
+    const inv = state.invCalls || 0;
+    const used = eff + inv;
+    const row = `| ${new Date().toISOString().slice(0, 16)} | ${state.taskInitial ?? state.taskBudget ?? BUDGET_DEFAULT} | ${used} | ${Math.max(0, (state.taskBudget || BUDGET_DEFAULT) - used)} | ${eff} | ${state.ineffCalls || 0} | ${new Date().toISOString()} |`;
+    const table = ["| 任务 | 初始额度 | 已用额度 | 剩余额度 | 有效调用 | 无效调用 | 更新时间 |", "|---|---|---|---|---|---|---|", row].join("\n");
+    t = t.replace(/### 【四】[\s\S]*?(?=\n### |\n## |$)/, () => "### 【四】工作额度台账\n\n" + table + "\n");
+    const tmp = p + ".tmp";
+    writeFileSync(tmp, t);
+    renameSync(tmp, p);
+  } catch {}
+}
+
+function fingerprint(absPath) {
+  const st = statSync(absPath);
+  const fp = { mtime: st.mtimeMs, size: st.size, sha: "" };
+  if (st.size <= SHA_LIMIT) fp.sha = createHash("sha256").update(readFileSync(absPath)).digest("hex").slice(0, 16);
+  return fp;
+}
+
+function gitDirty(projDir, absPath) {
+  try {
+    if (!projDir) return null;
+    const rel = normalize(absPath).replace(normalize(projDir) + "/", "");
+    const out = execFileSync("git", ["-C", projDir, "status", "--porcelain", "--", rel], {
+      encoding: "utf8",
+      timeout: 4000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim() ? 1 : 0;
+  } catch {
+    return null;
+  }
+}
+
+// 总纲五：优先级 依赖声明 > 人工标注 > 自适应
+function resolveTTL(projDir, rec, filePath) {
+  if (projDir) {
+    try {
+      const t = readFileSync(casePath(projDir), "utf8");
+      for (const line of sectionOf(t, "【二】").split("\n")) {
+        if (!line.startsWith("|")) continue;
+        const c = line.split("|").map((x) => x.trim());
+        if (c.length < 7) continue;
+        const [, name, , ipath, , ttl] = c;
+        const d = parseDur(ttl);
+        if (!d || !ipath || ipath === "安装路径") continue;
+        if (filePath.startsWith(normalize(ipath))) return { ms: d, src: `依赖声明:${name}` };
+      }
+    } catch {}
+  }
+  if (rec && rec.ttlOverride) {
+    const d = parseDur(rec.ttlOverride);
+    if (d) return { ms: d, src: "人工标注" };
+  }
+  if (!rec || !rec.lastChange) return { ms: TTL_FIRST, src: "自适应:首次4h" };
+  const age = Date.now() - rec.lastChange;
+  if (age >= 30 * 86400e3) return { ms: TTL_STABLE, src: "自适应:30天未变" };
+  if (age >= 7 * 86400e3) return { ms: TTL_WEEK, src: "自适应:7-30天未变" };
+  return { ms: TTL_RECENT, src: "自适应:7天内有变" };
+}
+
+// ============ 2.0 平台命令规则（总纲六：按检出 shell 适配） ============
+
+function platformBashViolation(env, cmd) {
+  if (!env) return null;
+  const c = String(cmd);
+  if (env.os === "win32" && env.shellIdKey === "powershell") {
+    if (/&&/.test(c)) return "Windows PowerShell 会话禁 &&：用 ; 分隔或分开执行";
+    if (/\|\s*(head|grep|wc|sed|awk)\b/.test(c)) return "PowerShell 禁 bash 管道工具：用 Select-String / Measure-Object / Select-Object -First";
+    if (/(^|[;&|]\s*)(cat|type|Get-Content)\s/i.test(c) && !/\|\s*Select-/.test(c) && !/-(TotalCount|First|Tail)\b/.test(c))
+      return "禁裸 cat/type/Get-Content 刷屏：用 Get-Content -TotalCount N -Encoding UTF8";
+  }
+  if (env.os === "darwin") {
+    if (/\bsed\s+-i(?!\s*['"])/.test(c)) return "macOS BSD sed：-i 必须带后缀参数（sed -i '' …）";
+    if (/\bgrep\s+[^|;&]*?-P\b/.test(c)) return "macOS BSD grep 不支持 -P：用 -E";
+    if (/\breadlink\s+-f\b/.test(c) && !/\bgreadlink\b/.test(c)) return "macOS 无 readlink -f：用 greadlink -f";
+  }
+  return null;
 }
 
 function isMutating(tool, ti, handoff) {
@@ -233,8 +498,16 @@ const path = statePath(sid);
 
 if (mode === "start") {
   rmSync(path, { force: true });
+  // 2.0 环境检测：会话级一次，写入 state.envCache（总纲三）
+  const env = detectEnv();
+  // 2.0 卷宗载入：重建 readSetCache 与 TTL 表（总纲七）
+  const st = loadState(path);
+  st.envCache = env;
+  st.envChecked = true;
+  const projDir = projectDir();
+  if (projDir) st.caseCache = loadCaseRecords(ensureCaseFile(projDir));
+  saveState(path, st);
   let ctx = SESSION_RULES;
-  const projDir = process.env.ZCODE_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || "";
   if (projDir) {
     // 36条 异地交叉巡视：新会话接手 → 复核前任结论
     try {
@@ -266,7 +539,7 @@ if (mode === "start") {
 }
 
 if (mode === "reset") {
-  // 批示：关键词预算/信用延期批复/特赦识别（本事件可能不触发，回合边界由 stop 兜底）
+  // 批示：关键词预算/信用延期批复/特赦识别/追加批示；保留侦查缓存（caseCache/envCache 不清）
   const state = loadState(path);
   const promptText =
     typeof input.prompt === "string"
@@ -278,6 +551,13 @@ if (mode === "reset") {
   const mercy = !!(grant && promptText.trim().length <= MERCY_SHORT);
   if (mercy) audit(sid, "mercy-granted", { level: null, evidence: `批示原文: ${grant[0]}`, pardon: true });
 
+  // 总纲三：仅当明确探测到 shell 变化时重检环境
+  if (state.envCache && state.envCache.shellIdKey && state.envCache.shellIdKey !== quickShellId()) {
+    state.envCache = detectEnv();
+    state.envChecked = true;
+    audit(sid, "env-redetect", { level: null, evidence: `shell 变化 → 重检为 ${state.envCache.shell}` });
+  }
+
   let creditGranted = false;
   const short = promptText.trim();
   if (short.length <= 12 && (state.stalledStreak || 0) >= 2 && CREDIT_RE.test(short)) {
@@ -286,7 +566,6 @@ if (mode === "reset") {
     state.invCap = Math.min((state.invCap || INV_POOL_DEFAULT) + REFILL, BUDGET_CAP); // 20条：侦查池同步追加
     state.invWarned = false;
     creditGranted = true;
-    audit(sid, "budget-extend", { level: null, evidence: `信用延期获批 budget=${state.taskBudget} eff=${state.effectiveCalls || 0} stall=0` });
   }
   const stopOrdered = short.length <= 12 && STOP_ORDER_RE.test(short);
   if (stopOrdered) {
@@ -316,9 +595,11 @@ if (mode === "reset") {
   const kw = KEY50_RE.test(promptText) ? 50 : KEY15_RE.test(promptText) ? 15 : BUDGET_DEFAULT;
   state.keywordBudget = kw;
   state.taskBudget = Math.max(kw, state.declaredBudget || 0, state.taskBudget || BUDGET_DEFAULT);
+  state.taskInitial = state.taskBudget;
+  state.ineffCalls = 0;
 
   saveState(path, {
-    ...state,
+    ...state, // envCache/envChecked/caseCache（侦查缓存）随 spread 保留
     turnCount: 0,
     seen: {},
     fused: false,
@@ -328,14 +609,14 @@ if (mode === "reset") {
     forcedInvestigate: false,
     probation: false,
     readSet: {},
-    mtimeSet: {},
     turnPrompt: promptText.slice(0, 500),
     taskBudget: state.taskBudget,
+    taskInitial: state.taskInitial,
     keywordBudget: kw,
     lastSig: "",
     lastInput: "",
   });
-  audit(sid, "reset-fired", { level: null, evidence: `prompt:${promptText ? "有" : "无"} kw=${kw} budget=${state.taskBudget} eff=${state.effectiveCalls || 0} stall=${state.stalledStreak || 0}${creditGranted ? " 信用延期" : ""}${mercy ? " 特赦" : ""}` });
+  audit(sid, "reset-fired", { level: null, evidence: `prompt:${promptText ? "有" : "无"} kw=${kw} budget=${state.taskBudget} eff=${state.effectiveCalls || 0} inv=${state.invCalls || 0} stall=${state.stalledStreak || 0}${creditGranted ? " 信用延期" : ""}${mercy ? " 特赦" : ""}` });
   process.exit(0);
 }
 
@@ -347,6 +628,31 @@ if (mode === "pre") {
   const filePath = normalize(rawPath);
   const handoff = /^(Write|Edit)$/.test(tool) && /(^|\/)handoff\.md$/i.test(filePath);
   const search = /^(WebSearch|WebFetch)$/.test(tool) || /mcp__.*(web|search)/i.test(tool);
+  const env = state.envCache || null;
+
+  // ===== 2.0 总纲六：环境规则检查（平台命令拦截）=====
+  if (tool === "Bash") {
+    const v = platformBashViolation(env, String(ti.command || ""));
+    if (v) {
+      audit(sid, "platform-deny", { level: null, evidence: `${env ? env.os + "/" + env.shellIdKey : "unknown"} ${v.slice(0, 100)}` });
+      process.stderr.write(`[平台规则·${env ? env.os + "/" + env.shellIdKey : "?"}]${v}`);
+      process.exit(2);
+    }
+  }
+  // 2.0 总纲六：大小写不敏感文件系统 → 禁仅大小写不同的重名文件
+  // 注意：不敏感 FS 上大小写变体目标的 existsSync 恒为 true，故不能以 existsSync 豁免
+  if (/^(Write|Edit)$/.test(tool) && rawPath && env && env.caseSensitive === false) {
+    try {
+      const dirp = dirname(rawPath);
+      const base = basename(rawPath);
+      const clash = readdirSync(dirp).find((e) => e !== base && e.toLowerCase() === base.toLowerCase());
+      if (clash) {
+        audit(sid, "platform-deny", { level: null, evidence: `2.0平台 大小写冲突 ${base} vs ${clash}` });
+        process.stderr.write(`[平台规则·大小写冲突]本文件系统大小写不敏感：${base} 与已有 ${clash} 仅大小写不同，创建后会互相覆盖。改名，或改用现有文件。`);
+        process.exit(2);
+      }
+    } catch {}
+  }
 
   if (tool === "Agent") {
     // 48条 子代理继承留痕：父会话处分状态随派单记录（平台无注入通道，以留痕方式移交）
@@ -412,22 +718,6 @@ if (mode === "pre") {
     }
   }
 
-  // 49条 缓存利用：同文件同 mtime 重复整读 → 拒绝（offset 增量读放行）
-  if (tool === "Read" && !ti.offset && rawPath) {
-    const prevMtime = (state.mtimeSet || {})[filePath];
-    if (prevMtime !== undefined) {
-      try {
-        if (statSync(rawPath).mtimeMs === prevMtime) {
-          audit(sid, "cache-dup-read", { level: null, evidence: `49条 重复整读 ${filePath}` });
-          process.stderr.write(
-            `[49条·缓存利用]${filePath} 本回合已读过且文件未变更（mtime 一致），同文件同 mtime 重复整读被拒。改用 offset 续读未读区段、Grep 定位行号，或直接复用已有结论。`
-          );
-          process.exit(2);
-        }
-      } catch {}
-    }
-  }
-
   // 触发③：体积刺客三闸
   if (tool === "Read" && !ti.limit && !ti.pages && rawPath) {
     try {
@@ -454,7 +744,7 @@ if (mode === "pre") {
 
   if (tool === "Bash") {
     const cmd = String(ti.command || "");
-    if (/(^|[;&|]\s*)(cat|type|Get-Content)\s/i.test(cmd) && !cmd.includes("|") && !cmd.includes(">")) {
+    if (/(^|[;&|]\s*)(cat|type|Get-Content)\s/i.test(cmd) && !cmd.includes("|") && !cmd.includes(">") && !/-(TotalCount|First|Tail)\b/.test(cmd)) {
       const level = penalize(state, sid, "violation-bash-gate", `裸 cat/type：${cmd.slice(0, 60)}`);
       saveState(path, state);
       process.stderr.write(
@@ -462,6 +752,36 @@ if (mode === "pre") {
       );
       process.exit(2);
     }
+  }
+
+  // ===== 2.0 总纲四：卷宗不重复读校验（跨回合）=====
+  // 指纹一致（mtime+size+SHA/git）且 TTL 未超 → 免重读放行：拦截本次 Read，复用已有取证。
+  // 指纹不一致 / TTL 超时 → 拦截免读资格，放行真重读（post 更新卷宗指纹）。
+  // 熔断/强制取证期豁免：降级重建证据需要真重读。offset 增量读永远放行。
+  if (tool === "Read" && rawPath && !ti.offset && !state.fused && !state.forcedInvestigate) {
+    try {
+      const rec = (state.caseCache || {})[filePath];
+      if (rec) {
+        const fp = fingerprint(rawPath);
+        const pDir = projectDir();
+        const dirty = fp.sha ? null : gitDirty(pDir, rawPath);
+        const changed =
+          rec.mtime !== fp.mtime ||
+          rec.size !== fp.size ||
+          (rec.sha && fp.sha && rec.sha !== fp.sha) ||
+          (rec.gitDirty !== null && rec.gitDirty !== undefined && dirty !== null && dirty !== rec.gitDirty);
+        if (!changed) {
+          const ttl = resolveTTL(pDir, rec, filePath);
+          if (Date.now() - (rec.readAt || 0) < ttl.ms) {
+            audit(sid, "casefile-hit", { level: null, evidence: `2.0卷宗 免重读 ${filePath} ttl=${ttl.src}` });
+            process.stderr.write(
+              `[卷宗·免重读放行]${filePath} 指纹一致（${rec.via || "mtime+size"}）且 TTL 未超（${ttl.src}）——已有取证仍有效，禁止重复整读。直接复用已有结论与记录；确需内容用 offset 增量读，或请人类批示。文件如已变更请说明——下次读取将自动更新卷宗指纹。`
+            );
+            process.exit(2);
+          }
+        }
+      }
+    } catch {}
   }
 
   process.exit(0);
@@ -491,16 +811,34 @@ if (mode === "post" || mode === "postfail") {
     state.readSet = state.readSet || {};
     if (ti.file_path && ["Read", "Write", "Edit"].includes(tool)) state.readSet[normalize(ti.file_path)] = 1;
     if (tool === "Grep" && typeof ti.path === "string") state.readSet[normalize(ti.path)] = 1;
-    // 49条：记录成功 Read 的 mtime，供 pre 阶段同 mtime 重复整读拦截
+    // ===== 2.0 总纲四/七：更新侦查取证记录（指纹 + TTL 依据）=====
     if (tool === "Read" && ti.file_path) {
       try {
-        state.mtimeSet = state.mtimeSet || {};
-        state.mtimeSet[normalize(ti.file_path)] = statSync(ti.file_path).mtimeMs;
+        const fp = fingerprint(ti.file_path);
+        const key = normalize(ti.file_path);
+        const cc = state.caseCache || {};
+        const prev = cc[key];
+        const changedFp = !!(prev && (prev.mtime !== fp.mtime || prev.size !== fp.size || (prev.sha && fp.sha && prev.sha !== fp.sha)));
+        cc[key] = {
+          path: ti.file_path,
+          mtime: fp.mtime,
+          size: fp.size,
+          sha: fp.sha || "",
+          gitDirty: fp.sha ? null : gitDirty(projectDir(), ti.file_path),
+          readAt: Date.now(),
+          changes: (prev ? prev.changes || 0 : 0) + (changedFp ? 1 : 0),
+          lastChange: prev ? (changedFp ? Date.now() : prev.lastChange || 0) : 0,
+          ttlOverride: prev ? prev.ttlOverride || "" : "",
+          via: fp.sha ? "mtime+size+sha" : "mtime+size+git",
+        };
+        state.caseCache = cc;
+        const pDir = projectDir();
+        if (pDir) saveCaseRecords(pDir, { ...loadCaseRecords(casePath(pDir)), ...cc });
       } catch {}
     }
   }
 
-  // ===== 动态预算：进度检测引擎（v1.0.0 核心）=====
+  // ===== 动态预算：进度检测引擎 =====
   let progress = false;
   if (mode === "post") {
     const probe = { parts: [], total: 0 };
@@ -538,6 +876,7 @@ if (mode === "post" || mode === "postfail") {
     }
   } else {
     state.stalledStreak = (state.stalledStreak || 0) + 1;
+    state.ineffCalls = (state.ineffCalls || 0) + 1;
     if ((state.stalledStreak || 0) >= STALL_FUSE) {
       state.fused = true;
       state.violations = Math.max(state.violations || 0, 3);
@@ -749,10 +1088,12 @@ if (mode === "stop") {
 
   state.stopBlocked = false;
   state.turnCount = 0;
-  state.mtimeSet = {}; // 49条：mtime 记录按回合失效（reset 为兜底）
   saveState(path, state);
+  // 2.0 总纲七：更新工作额度台账到卷宗
+  const pDir = projectDir();
+  if (pDir) saveLedger(pDir, state);
   // 回合诊断：与 reset-fired 对照，定位 UserPromptSubmit 是否触发
-  audit(sid, "stop-fired", { level: null, evidence: `turnCalls=${input && input.stop_hook_active !== undefined ? "有" : "?"} eff=${state.effectiveCalls || 0} budget=${state.taskBudget}` });
+  audit(sid, "stop-fired", { level: null, evidence: `turnCalls=${input && input.stop_hook_active !== undefined ? "有" : "?"} eff=${state.effectiveCalls || 0} inv=${state.invCalls || 0} budget=${state.taskBudget}` });
   process.exit(0);
 }
 

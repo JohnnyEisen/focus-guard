@@ -277,23 +277,25 @@ focus-guard/
 └── README.md                 ← 项目说明 + 保命声明
 ```
 
-### 附：实施状态与部署对照（截至 v1.1.1，2026-09-29 核验）
+### 附：实施状态与部署对照（截至 v2.0.0，2026-09-29 核验）
 
-**实施状态**（自本节起为工程附注，非法条原文）：运行时只加载常驻提示词 + 钩子代码，本文件不参与运行。引擎 `hooks/guard.mjs` v1.1.1；常驻注入 500 字整（立法硬上限 ≤500 字），构成 299 全角 + 187 ASCII，约 260~355 Token（【假设】，待 tokenizer 实测）。
+**实施状态**（自本节起为工程附注，非法条原文）：运行时只加载常驻提示词 + 钩子代码，本文件不参与运行。引擎 `hooks/guard.mjs` v2.0.0（卷宗体系重构，总纲见 `docs/MASTER-PLAN-2.0.0.md`）；常驻注入 500 字整（立法硬上限 ≤500 字），构成 299 全角 + 187 ASCII，约 260~355 Token（【假设】，待 tokenizer 实测）。
 
 实际发布结构为适配 ZCode 插件规范，与上述蓝图存在以下映射关系：
 
 | 蓝图路径 | 实际部署 | 说明 |
 |----------|----------|------|
 | `docs/RULES.md` | `docs/RULES.md` | 本文件，2026-09-29 新建归档 |
-| `src/guard.mjs` | `hooks/guard.mjs` | 引擎 v1.1.1；常驻提示词以 `SESSION_RULES` 常量内嵌，经 SessionStart 注入 |
+| `src/guard.mjs` | `hooks/guard.mjs` | 引擎 v2.0.0；常驻提示词以 `SESSION_RULES` 常量内嵌，经 SessionStart 注入 |
 | `src/constants.mjs` | 并入 `hooks/guard.mjs` | 阈值未独立成文件 |
 | `prompts/core-discipline.md` | `skills/focus-thinking/SKILL.md`（§7–§8） | 条文镜像，共 109 行 |
 | `README.md` | `README.md` | 已就绪 |
 | — | `.focus-guard/AUDIT.log` | 执法档案（JSONL，表6字段） |
-| — | `tests/acceptance.test.mjs` | 验收 21 用例（`node --test`） |
+| — | `tests/acceptance.test.mjs` | 验收 33 用例（`node --test`） |
 
-**实施差异备忘**（引擎 v1.1.1 相对初版蓝图）：
+**实施差异备忘**（引擎 v2.0.0 相对初版蓝图）：
+
+- **v2.0.0 卷宗重构**（总纲 `docs/MASTER-PLAN-2.0.0.md`，破坏性变更）：卷宗四册（`.ai/CASE_FILE.md`：环境声明/依赖声明/侦查记录/额度台账）、会话级环境检测（`state.envCache`，仅 shell 变化重检）、跨回合取证指纹（mtime+size+SHA-256≤200KB+git 脏态，时间戳伪造不可绕过）、自适应 TTL（4h/2h/24h/7天，依赖声明>人工标注>自适应）、免重读放行（熔断期豁免、offset 永远放行）、跨平台命令拦截（按检出 shell 适配：PS 禁 bash 管道、macOS BSD 三禁、大小写冲突拦截）、额度台账落卷。**旧第四十九条 mtime 逐回合闸废弃**，由卷宗指纹+TTL 体系跨回合替代。
 
 - **v1.1.1 注入合规**：常驻注入 `SESSION_RULES` 由 1170 字压缩至 **500 字整**（立法硬上限 ≤500 字），机制细节回归钩子报文、`focus-thinking` 技能镜像与本文件。
 - **v1.1.0 已编译落地**：双预算池（第二十条，侦查/执行分池+『追加额度』批示）、mtime 缓存闸（第四十九条）、上下文污染检测（第五十八条，head 行数超限/清单路径重复）、残留核验（第四十三条）、异地交叉巡视（第三十六条，SessionStart 检测 HANDOFF.md）、部署版本核验（第四十二条）、子代理状态留痕（第四十八条）、追加批示（第二十四条三）。
