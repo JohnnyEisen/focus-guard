@@ -461,3 +461,37 @@ describe("跨平台命令拦截（总纲六）", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("环境检测防误判（2.0.1）", () => {
+  test("Git Bash 环境识别为 bash", () => {
+    const run = makeRunner("env-bash2");
+    const dir = freshDir();
+    run("start", { session_id: "env-bash2" }, { ZCODE_PROJECT_DIR: dir, SHELL: "C:\\Program Files\\Git\\usr\\bin\\bash.exe" });
+    assert.equal(stateOf("env-bash2").envCache.shellIdKey, "bash");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("pwsh7 特征 PSModulePath 才判为 powershell", () => {
+    const run = makeRunner("env-pwsh7");
+    const dir = freshDir();
+    run("start", { session_id: "env-pwsh7" }, { ZCODE_PROJECT_DIR: dir, SHELL: "", PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules;C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\Modules" });
+    assert.equal(stateOf("env-pwsh7").envCache.shellIdKey, "powershell");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("系统默认 PSModulePath + cmd → 不误判为 powershell", () => {
+    const run = makeRunner("env-cmd2");
+    const dir = freshDir();
+    run("start", { session_id: "env-cmd2" }, { ZCODE_PROJECT_DIR: dir, SHELL: "", PSModulePath: "C:\\Program Files (x86)\\WindowsPowerShell\\Modules;C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\Modules", ComSpec: "C:\\WINDOWS\\system32\\cmd.exe" });
+    const key = stateOf("env-cmd2").envCache.shellIdKey;
+    assert.notEqual(key, "powershell");
+    assert.equal(key, "cmd");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("误判场景下 Git Bash 管道命令不被平台规则拦截", () => {
+    const run = makeRunner("env-nops");
+    writeState("env-nops", { envCache: { os: "win32", shellIdKey: "cmd" }, envChecked: true });
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "grep -rn x . | head -5" } }).rc, 0);
+  });
+});

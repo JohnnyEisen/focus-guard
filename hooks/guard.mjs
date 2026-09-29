@@ -33,7 +33,8 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.0.0"; // 42条：部署版本核验基准
+const ENGINE_VERSION = "2.0.1"; // 42条：部署版本核验基准
+// 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -193,8 +194,14 @@ function quickShellId() {
   if (process.platform === "win32") {
     const sh = String(process.env.SHELL || "");
     if (/bash|zsh|sh\b/i.test(sh)) return "bash";
-    if (process.env.PSModulePath) return "powershell";
-    return String(process.env.ComSpec || "").toLowerCase().includes("cmd") ? "cmd" : "unknown";
+    // 2.0.1 修复：PSModulePath 系统级恒存（Windows PowerShell 5.0 起写入机器环境），
+    // 不足以证明当前是 PowerShell 会话；仅认 pwsh7 特征路径 / ComSpec 指向 PowerShell。
+    // 其余一律落 cmd/unknown → 不启用平台禁令（误判宁宽勿严，避免堵死 Git Bash 工作流）。
+    const psm = String(process.env.PSModulePath || "");
+    if (/Program Files[\\/]+PowerShell/i.test(psm)) return "powershell";
+    const cs = String(process.env.ComSpec || "");
+    if (/powershell/i.test(cs)) return "powershell";
+    return cs.toLowerCase().includes("cmd") ? "cmd" : "unknown";
   }
   return String(process.env.SHELL || "sh").split(/[\\/]/).pop() || "sh";
 }
