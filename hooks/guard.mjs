@@ -33,12 +33,15 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.2.0"; // 42条：部署版本核验基准
+const ENGINE_VERSION = "2.3.0"; // 42条：部署版本核验基准
 // 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
 // 2.0.2 DSH 版：csproj/sln 列入风险文件备案（C# 项目配置与 package.json 同级）
 // 2.2.0 正面指引版：git push 人类专属闸（二.3/五.3，本地 commit AI 可做、推送人类 UI 执行）
 //   + 污染核实闸（三.1，输出矛盾后首个改动类先拦一次，要求先出【污染核实】声明）
 //   + 改动前自动备份 .ai/backup/（一.2，无 .git 工作区的物理回滚依据）+ 熔断出口提示经验固化 PATTERNS.md（六.1）
+// 2.3.0 委派条例：委托池独立核算（默认20次，不占执行池，批示『追加委托额度』+10）+ 子代理摘要格式校验
+//   （【子代理摘要】四字段≤200字，否则拒收）+ 强制委派场景检测（全库搜索/大文档/批量处理，未委派 KPI-5）
+//   + 熔断期启动子代理=越权绕行（L4记档+L5降权）+ 委派 KPI（+5/+3/-5/-3）
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -67,6 +70,7 @@ const MUTATING_BASH_RE = /(^|[;&|]\s*)(rm|rmdir|mv|del|rd|git\s+(add|commit|push
 const FILE_REDIRECT_RE = /(^|\s)>{1,2}(?!\s*&)/;
 const PUSH_RE = /\bgit\s+(?:-[A-Za-z]\S*\s+)*(?:-c\s+\S+\s+)*push\b/i; // 2.2.0：git push（含 -C/-c 传参），--dry-run 例外
 const BACKUP_KEEP = 100; // 2.2.0：.ai/backup/ 最大保留份数（超出淘汰最旧）
+const DELEGATE_DEFAULT = 20; // 2.3.0：委托池默认额度（独立于执行池，批示『追加委托额度』+10）
 
 const DOWNGRADE_MSG =
   "[触发⑤·熔断]改动类工具调用已拒绝（只读调查类仍放行）。按优先级给降级方案：" +
@@ -214,6 +218,13 @@ function loadState(path) {
       caseCache: {},
       taskInitial: BUDGET_DEFAULT,
       pollutionFlagged: false,
+      delegateBudget: DELEGATE_DEFAULT, // 2.3.0：委托池 granted 上限（只升不降）
+      delegateUsed: 0, // 2.3.0：委托池累计消耗
+      delegated: false, // 2.3.0：本任务是否已委派过
+      kpi: 0, // 2.3.0：委派 KPI 累计分
+      kpiScolded: {}, // 2.3.0：每场景每任务只提醒一次
+      kpiDelegatedAwarded: false, // 2.3.0：+5 每任务一次
+      editedFiles: {}, // 2.3.0：本任务改过的文件集合（批量场景判定）
     };
   }
 }
@@ -653,12 +664,13 @@ if (mode === "reset") {
     audit(sid, "stall-fuse", { level: 3, evidence: "人类批示停止" });
   }
 
-  // 24条(三) 追加批示：明示追加 → 双池+10
+  // 24条(三) 追加批示：明示追加 → 执行池/侦查池/委托池各+10
   if (short.length <= 12 && /追加|增加额度|扩大额度/.test(short)) {
     state.taskBudget = Math.min((state.taskBudget || BUDGET_DEFAULT) + REFILL, BUDGET_CAP);
     state.invCap = Math.min((state.invCap || INV_POOL_DEFAULT) + REFILL, BUDGET_CAP);
     state.invWarned = false;
-    audit(sid, "budget-extend", { level: null, evidence: `24条(三) 追加批示 budget=${state.taskBudget} invCap=${state.invCap}` });
+    state.delegateBudget = Math.min((state.delegateBudget ?? DELEGATE_DEFAULT) + REFILL, BUDGET_CAP); // 2.3.0：委托池同步追加
+    audit(sid, "budget-extend", { level: null, evidence: `24条(三) 追加批示 budget=${state.taskBudget} invCap=${state.invCap} delegate=${state.delegateBudget}` });
   }
 
   // 43条 状态重置核验：上一回合残留 → 记档报告后清理（本事件随后统一重置）
@@ -678,7 +690,7 @@ if (mode === "reset") {
   state.ineffCalls = 0;
 
   saveState(path, {
-    ...state, // envCache/envChecked/caseCache（侦查缓存）随 spread 保留
+    ...state, // envCache/envChecked/caseCache（侦查缓存）随 spread 保留；kpi/delegateUsed（考核与委托台账）跨回合保留
     turnCount: 0,
     seen: {},
     fused: false,
@@ -688,6 +700,11 @@ if (mode === "reset") {
     forcedInvestigate: false,
     probation: false,
     readSet: {},
+    // 2.3.0：delegateBudget 跨回合保留（用尽须批示追加，不自动回满）；pollutionFlagged 有意不清（跨回合存活至消费）
+    delegated: false, // 2.3.0：新回合重置委派标记与场景判定
+    editedFiles: {},
+    kpiScolded: {},
+    kpiDelegatedAwarded: false,
     turnPrompt: promptText.slice(0, 500),
     taskBudget: state.taskBudget,
     taskInitial: state.taskInitial,
@@ -749,11 +766,36 @@ if (mode === "pre") {
   }
 
   if (tool === "Agent") {
+    // 2.3.0 四：越权绕行边界——仅熔断期启动子代理属违规（L4 记档 + L5 降权）；正常委派放行不计违规
+    if (state.fused) {
+      state.violations = Math.max(state.violations || 0, 4);
+      const lvl = penalize(state, sid, "violation-subagent-usurp", `56条 熔断期启动子代理 ${String(ti.description || ti.prompt || "").slice(0, 60)}`);
+      saveState(path, state);
+      process.stderr.write(
+        `[越权绕行·L${lvl}]熔断期间启动子代理执行被禁操作，按对抗审查论处：L4 记档 + L5 降权。` +
+          `熔断期只读调查可亲自执行（白名单放行），或输出『${FUSE_PHRASE}』走降级方案，或等人类批示解除。${ladderNote(lvl)}`
+      );
+      process.exit(2);
+    }
     // 48条 子代理继承留痕：父会话处分状态随派单记录（平台无注入通道，以留痕方式移交）
     audit(sid, "subagent-spawn", {
       level: null,
       evidence: `48条 父状态 fused=${!!state.fused} L${state.violations || 0} eff=${state.effectiveCalls || 0} inv=${state.invCalls || 0} | ${String(ti.description || ti.prompt || "").slice(0, 60)}`,
     });
+    // 2.3.0 一：委托池独立核算（不占执行池；用尽须人类批示追加）
+    if ((state.delegateBudget ?? DELEGATE_DEFAULT) <= 0) {
+      audit(sid, "delegate-exhausted", { level: null, evidence: `2.3.0 委托池用尽 剩余=0 累计=${state.delegateUsed || 0}` });
+      process.stderr.write(
+        "[委托池用尽]本任务子代理额度已用完（默认 20 次，独立于主会话执行池，不互相挤占）。" +
+          "继续委派请人类批示『追加委托额度』（+10）；或在主会话执行池内自行完成并尽快收敛。"
+      );
+      process.exit(2);
+    }
+    state.delegateBudget = (state.delegateBudget ?? DELEGATE_DEFAULT) - 1;
+    state.delegateUsed = (state.delegateUsed || 0) + 1;
+    state.delegated = true;
+    saveState(path, state);
+    audit(sid, "delegate-used", { level: null, evidence: `2.3.0 委托池消耗 剩余=${state.delegateBudget} 累计=${state.delegateUsed} | ${String(ti.description || "").slice(0, 50)}` });
   }
 
   // 触发⑤：熔断期白名单——只读调查类 + 降级动作放行，改动类拒绝（L3 放行只读工具）
@@ -966,9 +1008,16 @@ if (mode === "post" || mode === "postfail") {
   const inv = isInvestigation(tool, ti);
   if (progress) {
     // 20条 双预算池：侦查(只读)与执行(改动)分池计数，不互相挤占
-    if (inv) state.invCalls = (state.invCalls || 0) + 1;
-    else state.effectiveCalls = (state.effectiveCalls || 0) + 1;
-    state.stalledStreak = 0;
+    if (tool === "Agent") {
+      // 2.3.0：委派不占主会话执行池（委托池已在 pre 核算），仅计入进度
+      state.stalledStreak = 0;
+    } else if (inv) {
+      state.invCalls = (state.invCalls || 0) + 1;
+      state.stalledStreak = 0;
+    } else {
+      state.effectiveCalls = (state.effectiveCalls || 0) + 1;
+      state.stalledStreak = 0;
+    }
     if ((state.effectiveCalls || 0) >= BUDGET_CAP) {
       state.fused = true;
       state.violations = Math.max(state.violations || 0, 3);
@@ -1040,6 +1089,71 @@ if (mode === "post" || mode === "postfail") {
       reason =
         `体积刺客：本次 ${tool} 输出约 ${Math.round(probe.total / 1024)}KB，已进上下文无法撤回。` +
         `下一次必须管道过滤(head/tail/wc/grep)后再执行。本会话已累计 ${state.dumpCount} 次。`;
+    }
+  }
+
+  // ===== 2.3.0 二/五：子代理摘要格式校验（只收【子代理摘要】，≤200字）=====
+  if (!reason && mode === "post" && tool === "Agent") {
+    const probeSum = { parts: [], total: 0 };
+    collectStrings(input.tool_response ?? {}, probeSum, 20000);
+    const sumText = probeSum.parts.join(" ");
+    const fmtOk =
+      /【子代理摘要】/.test(sumText) &&
+      /任务[:：]/.test(sumText) &&
+      /结果[:：]/.test(sumText) &&
+      /异常[:：]/.test(sumText) &&
+      /文件线索[:：]/.test(sumText);
+    if (!fmtOk || sumText.length > 200) {
+      state.kpi = (state.kpi || 0) - 3;
+      audit(sid, "delegate-summary-pollution", { level: null, evidence: `2.3.0 摘要污染 -3 len=${sumText.length} fmt=${fmtOk ? "有" : "无"}` });
+      reason =
+        "[委派摘要拒收·KPI-3]子代理回传未按摘要格式或超过 200 字，拒绝全量采纳——不要把子代理输出原样搬进主会话。" +
+        "压缩为：【子代理摘要】任务：<一句话>｜结果：<≤5条关键信息>｜异常：<无/具体报错>｜文件线索：<文件:行号>，以此为准继续工作。";
+    } else {
+      state.kpi = (state.kpi || 0) + 3;
+      audit(sid, "kpi-summary-good", { level: null, evidence: `2.3.0 委派摘要合格 +3 len=${sumText.length}` });
+    }
+  }
+
+  // ===== 2.3.0 三/五：强制委派场景检测（该委派不委派 → KPI-5 提醒；已委派 → KPI+5 一次）=====
+  if (!reason && mode === "post") {
+    const probeSc = { parts: [], total: 0 };
+    collectStrings(input.tool_response ?? {}, probeSc, 50000);
+    const scLines = probeSc.parts.join("\n").split("\n").map((l) => l.trim()).filter(Boolean);
+    const scPaths = scLines.filter((l) => /[\/\\]/.test(l) && l.length <= 200 && !/^(total|\.\.?|d[-rwx]|-[-rwx])/.test(l));
+    const scDirs = new Set(scPaths.map((l) => l.replace(/[\/\\][^\/\\]*$/, "")));
+    let scenario = "";
+    if (tool === "Grep" || (tool === "Bash" && /\b(find|rg|grep)\b/i.test(String(ti.command || "")))) {
+      if (scPaths.length >= 10 || scDirs.size >= 3) scenario = "全库搜索";
+    } else if (tool === "Read" && ti.file_path) {
+      let kb = 0;
+      try { kb = statSync(ti.file_path).size / 1024; } catch {}
+      if (kb > OUTPUT_GATE_BYTES / 1024 || scLines.length > 2000) scenario = "大文档摘要";
+    } else if ((tool === "Write" || tool === "Edit") && ti.file_path) {
+      state.editedFiles = state.editedFiles || {};
+      state.editedFiles[normalize(ti.file_path)] = 1;
+      if (Object.keys(state.editedFiles).length >= 5) scenario = "批量文件处理";
+    }
+    if (scenario) {
+      if (state.delegated) {
+        if (!state.kpiDelegatedAwarded) {
+          state.kpiDelegatedAwarded = true;
+          state.kpi = (state.kpi || 0) + 5;
+          audit(sid, "kpi-delegated", { level: null, evidence: `2.3.0 强制场景已委派 +5 ${scenario}` });
+        }
+      } else {
+        state.kpiScolded = state.kpiScolded || {};
+        const key = scenario === "全库搜索" ? "search" : scenario === "大文档摘要" ? "bigdoc" : "batch";
+        if (!state.kpiScolded[key]) {
+          state.kpiScolded[key] = true;
+          state.kpi = (state.kpi || 0) - 5;
+          audit(sid, "kpi-not-delegated", { level: null, evidence: `2.3.0 强制场景未委派 -5 ${scenario}` });
+          reason =
+            `[未尽职·KPI-5]${scenario}属强制委派场景（全库搜索≥3目录或≥10文件 / 大文档>50KB或>2000行 / 批量≥5文件 / 独立并行任务），本任务尚未委派子代理，主会话上下文因此膨胀。` +
+            `改用 Agent 委派执行：委派池独立核算（默认 20 次，不占执行池），主会话只收【子代理摘要】。` +
+            `合法委派不计违规；确属特例无需委派的，向人类说明并留痕。`;
+        }
+      }
     }
   }
 
