@@ -1,0 +1,7 @@
+{
+  "name": "focus-guard",
+  "version": "2.2.0",
+  "description": "AI履职执法模型v3.0+动态预算+卷宗体系2.0+正面指引2.2.0（全自动）：卷宗档案四册、会话级环境检测、跨回合取证指纹(SHA-256防伪)、自适应TTL、免重读放行、跨平台命令拦截、行为触发五条、双预算池(20条)、上下文污染检测(58条)+污染核实闸、残留核验、交叉巡视、部署版本核验、L1-L6梯度处罚、熔断期只读放行、推送人类专属闸、改动前自动备份.ai/backup、PATTERNS.md经验按需检索",
+  "author": { "name": "JohnnyEisen", "url": "https://github.com/JohnnyEisen" },
+  "hooks": "./hooks/hooks.json"
+}
