@@ -736,3 +736,75 @@ describe("高危命令闸（v2.4.0）", () => {
     assert.equal(stateOf("goal1").highRiskOk, false);
   });
 });
+
+describe("极限场景（v2.4.1）", () => {
+  test("特征库变体：git -C 传参推送 / rm --recursive / node rmSync 均被拦；普通 rm 自由", () => {
+    const run = makeRunner("ext-var");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "git -C . push origin main" } }).rc, 2);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm --recursive build" } }).rc, 2);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "node -e \"require('fs').rmSync('x',{recursive:true})\"" } }).rc, 2);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "mysql -e 'DELETE FROM users'" } }).rc, 2); // 无 where
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "mysql -e 'DELETE FROM users WHERE id=1'" } }).rc, 0); // 带 where 自由
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm single.txt" } }).rc, 0);
+  });
+
+  test("超大输入：80KB 命令行 5 秒内判定；2MB 工具响应触发追责而非崩溃", () => {
+    const run = makeRunner("ext-big");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    const big = "git status // " + "pad ".repeat(20000);
+    const t0 = Date.now();
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: big } }).rc, 0);
+    assert.ok(Date.now() - t0 < 5000, "大命令行判定超时");
+    const r = run("post", { tool_name: "Grep", tool_input: { pattern: "x", output_mode: "content", head_limit: 10 }, tool_response: { content: "x".repeat(2 * 1024 * 1024) } });
+    assert.ok(r.out.includes("体积刺客"));
+  });
+
+  test("状态健壮性：损坏的 state JSON 自动降级默认值；奇异会话 ID 消毒", () => {
+    const run = makeRunner("ext-corrupt");
+    writeFileSync(join(tmpdir(), `focus-guard-ext-corrupt-${RUN}.json`), "{corrupted json!!");
+    run("reset", { prompt: "看看情况" });
+    assert.equal(stateOf("ext-corrupt").taskBudget, 10);
+    const weird = "../x/..\\a b:c";
+    run("reset", { session_id: weird, prompt: "看看情况" });
+    const san = weird.replace(/[^A-Za-z0-9._-]/g, "_");
+    const s = JSON.parse(readFileSync(join(tmpdir(), `focus-guard-${san}-${RUN}.json`), "utf8"));
+    assert.equal(s.taskBudget, 10); // 消毒后正常读写，无路径穿越
+  });
+
+  test("中文路径：取证、改动前备份全链路可用", () => {
+    const run = makeRunner("ext-cjk");
+    const dir = freshDir();
+    mkdirSync(join(dir, "中文目录"), { recursive: true });
+    const f = join(dir, "中文目录", "测试文件.txt");
+    writeFileSync(f, "内容v1");
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "内容v1" } });
+    assert.equal(r("pre", { tool_name: "Edit", tool_input: { file_path: f, old_string: "内容v1", new_string: "内容v2" } }).rc, 0);
+    const bd = join(dir, ".ai", "backup");
+    const backups = readdirSync(bd, { recursive: true }).filter((x) => String(x).endsWith(".bak"));
+    assert.ok(backups.length >= 1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("caseCache 上限裁剪：超过 200 条按取证时间淘汰最旧", () => {
+    const run = makeRunner("ext-case");
+    const dir = freshDir();
+    const f = join(dir, "new.txt");
+    writeFileSync(f, "n");
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    const cc = {};
+    for (let i = 0; i < 205; i++) cc["f" + i + ".txt"] = { mtime: 1, size: 1, sha: "", gitDirty: null, readAt: i, changes: 0, lastChange: 0, ttlOverride: "", via: "mtime+size" };
+    writeState("ext-case", { caseCache: cc });
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "n" } });
+    const s = stateOf("ext-case");
+    assert.ok(Object.keys(s.caseCache).length <= 200);
+    assert.equal(s.caseCache["f0.txt"], undefined);
+    assert.ok(s.caseCache[join(dir, "new.txt").replace(/\\/g, "/")] || s.caseCache[f.replace(/\\/g, "/")]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
