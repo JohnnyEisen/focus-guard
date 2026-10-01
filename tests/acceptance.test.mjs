@@ -808,4 +808,18 @@ describe("极限场景（v2.4.1）", () => {
     assert.ok(s.caseCache[join(dir, "new.txt").replace(/\\/g, "/")] || s.caseCache[f.replace(/\\/g, "/")]);
     rmSync(dir, { recursive: true, force: true });
   });
+
+  test("DSH 桥接签名：Stop 无收尾文本时锚点/审批单打回降级审计（防桥接强制续跑死循环），ZCode 载荷不受影响", () => {
+    const run = makeRunner("dsh-stop");
+    run("reset", { prompt: "看看情况" });
+    for (let i = 1; i <= 6; i++) run("post", { tool_name: "Read", tool_input: { file_path: `f${i}.txt`, limit: 5 }, tool_response: { content: `v${i}` } });
+    const r = run("stop", { transcript_path: "", stop_hook_active: false }); // DSH 桥接签名
+    assert.equal(r.out, "");
+    writeState("dsh-stop", { highRiskDeniedThisTurn: true });
+    assert.equal(run("stop", { transcript_path: "", stop_hook_active: false }).out, "");
+    assert.ok(auditOf("dsh-stop").includes("dsh-stop-observe"));
+    run("reset", { prompt: "看看情况" });
+    for (let i = 1; i <= 6; i++) run("post", { tool_name: "Read", tool_input: { file_path: `g${i}.txt`, limit: 5 }, tool_response: { content: `w${i}` } });
+    assert.ok(run("stop", { response: "就这样了" }).out.includes("证据锚点")); // ZCode 载荷照常打回
+  });
 });
