@@ -8,7 +8,7 @@
     {
       "name": "focus-guard",
       "source": "./",
-      "version": "2.4.0",
+      "version": "2.4.1",
       "description": "AI履职执法模型v3.0+动态预算+卷宗体系2.0+正面指引2.2.0+委派条例2.3.0（全自动）：卷宗四册、取证指纹、双预算池、污染检测+污染核实闸、L1-L6梯度处罚、推送人类专属闸、改动前自动备份、PATTERNS经验检索、委托池独立核算、子代理摘要强制格式、强制委派场景KPI；兼容层清单：DSH 查找顺序第2位（.claude-plugin/marketplace.json），ZCode 用仓库根 marketplace.json；2.4.0高危命令闸：完全访问下rm类/强推/清盘/删库/发包仍须【高危命令申请】+人类批示，批准后逐字一致才放行；放松日常+刚性高危",
       "displayName": "FocusGuard 聚焦护栏"
     }
