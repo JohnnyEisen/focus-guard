@@ -746,6 +746,7 @@ describe("极限场景（v2.4.1）", () => {
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm --recursive build" } }).rc, 2);
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "node -e \"require('fs').rmSync('x',{recursive:true})\"" } }).rc, 2);
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "mysql -e 'DELETE FROM users'" } }).rc, 2); // 无 where
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "mysql -e 'DROP DATABASE app'" } }).rc, 2);
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "mysql -e 'DELETE FROM users WHERE id=1'" } }).rc, 0); // 带 where 自由
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm single.txt" } }).rc, 0);
   });
