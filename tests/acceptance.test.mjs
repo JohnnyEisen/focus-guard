@@ -662,3 +662,39 @@ describe("子代理委派（v2.3.0）", () => {
     assert.equal(stateOf("del-E").delegateUsed, 21);
   });
 });
+
+describe("高危命令闸（v2.4.0）", () => {
+  test("rm 类：申请 → 人类批准 → 逐字一致放行；改动命令须重新申请；普通 rm 不设卡", () => {
+    const run = makeRunner("hr1");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    const r1 = run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf build" } });
+    assert.equal(r1.rc, 2);
+    assert.ok(r1.out.includes("高危命令闸"));
+    assert.ok(r1.out.includes("高危命令申请"));
+    assert.equal(stateOf("hr1").highRiskCmd, "rm -rf build"); // 待批命令已记录
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf build" } }).rc, 2); // 未批示前重试仍拒
+    run("reset", { prompt: "同意" });
+    assert.equal(stateOf("hr1").highRiskOk, true);
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v3" } }); // 新回合照常先取证
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf build" } }).rc, 0); // 批示后逐字一致 → 放行
+    assert.ok(auditOf("hr1").includes("high-risk-approved"));
+    const r2 = run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf build2" } });
+    assert.equal(r2.rc, 2); // 改动命令 → 重新申请
+    assert.ok(auditOf("hr1").includes("high-risk-request"));
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v2" } });
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm single.txt" } }).rc, 0); // 普通单文件 rm 不设卡
+  });
+
+  test("其他高危类（npm publish / del /s）同样须审批；批准语义仅认短指令", () => {
+    const run = makeRunner("hr2");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "npm publish" } }).rc, 2);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "del /s /q dist" } }).rc, 2);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "npm run build" } }).rc, 0); // 常规构建不设卡
+    run("reset", { prompt: "这个问题我们先讨论一下别的，稍后再说" }); // 长句不构成批示
+    assert.equal(stateOf("hr2").highRiskOk, false);
+  });
+});
