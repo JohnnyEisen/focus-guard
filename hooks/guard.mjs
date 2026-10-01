@@ -33,7 +33,7 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.3.0"; // 42条：部署版本核验基准
+const ENGINE_VERSION = "2.4.0"; // 42条：部署版本核验基准
 // 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
 // 2.0.2 DSH 版：csproj/sln 列入风险文件备案（C# 项目配置与 package.json 同级）
 // 2.2.0 正面指引版：git push 人类专属闸（二.3/五.3，本地 commit AI 可做、推送人类 UI 执行）
@@ -42,6 +42,7 @@ const ENGINE_VERSION = "2.3.0"; // 42条：部署版本核验基准
 // 2.3.0 委派条例：委托池独立核算（默认20次，不占执行池，批示『追加委托额度』+10）+ 子代理摘要格式校验
 //   （【子代理摘要】四字段≤200字，否则拒收）+ 强制委派场景检测（全库搜索/大文档/批量处理，未委派 KPI-5）
 //   + 熔断期启动子代理=越权绕行（L4记档+L5降权）+ 委派 KPI（+5/+3/-5/-3）
+// 2.4.0 高危命令闸：完全访问下 rm 类命令仍须【高危命令申请】+人类批示，批准后逐字一致才放行；放松日常+刚性高危
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -72,6 +73,8 @@ const FILE_REDIRECT_RE = /(^|\s)>{1,2}(?!\s*&)/;
 const PUSH_RE = /\bgit\s+(?:-[A-Za-z]\S*\s+)*(?:-c\s+\S+\s+)*push\b/i; // 2.2.0：git push（含 -C/-c 传参），--dry-run 例外
 const BACKUP_KEEP = 100; // 2.2.0：.ai/backup/ 最大保留份数（超出淘汰最旧）
 const DELEGATE_DEFAULT = 20; // 2.3.0：委托池默认额度（独立于执行池，批示『追加委托额度』+10）
+// 2.4.0 高危命令清单：即使完全访问也须人类审批（递归删除/强推/清盘/删库/断电/发包/容器清理）；普通单文件 rm 不在此列
+const HIGH_RISK_RE = /(\bsudo\b\s*)?\brm\b[^&|;]*\s-\w*r\w*|\brmdir\b[^&|;]*\/s|\bdel\b[^&|;]*\/s|\brd\b[^&|;]*\/s|Remove-Item\s[^&|;]*-Recurse|\bgit\s+push\b[^&|;]*(--force|\s-f\s)|\bgit\s+clean\b[^&|;]*-\w*f|\bmkfs\b|\bformat\s+[a-z]:|\bdiskpart\b|\bdd\b[^&|;]*of=\/dev\/|\bchmod\s+-R\b|\bicacls\b[^&|;]*\/grant|\bdrop\s+(table|database)\b|\btruncate\s+table\b|\breg\s+delete\b|\bshutdown\b|\bnpm\s+publish\b|\bpnpm\s+publish\b|\byarn\s+publish\b|\bdocker\s+(system\s+prune|volume\s+rm)/i;
 
 const DOWNGRADE_MSG =
   "[触发⑤·熔断]改动类已拒（只读放行）。三选一各一行：" + FUSE_HINT +
@@ -216,6 +219,8 @@ function loadState(path) {
       taskInitial: BUDGET_DEFAULT,
       pollutionFlagged: false,
       pushAuthorized: false,
+      highRiskOk: false, // 2.4.0：高危命令本回合已获批示
+      highRiskCmd: "", // 2.4.0：待批/已批的高危命令原文（逐字一致校验基准）
       delegateBudget: DELEGATE_DEFAULT, // 2.3.0：委托池 granted 上限（只升不降）
       delegateUsed: 0, // 2.3.0：委托池累计消耗
       delegated: false, // 2.3.0：本任务是否已委派过
@@ -674,6 +679,12 @@ if (mode === "reset") {
     audit(sid, "budget-extend", { level: null, evidence: `24条(三) 追加批示 budget=${state.taskBudget} invCap=${state.invCap} delegate=${state.delegateBudget}` });
   }
 
+  // 2.4.0：高危命令批准——人类短指令明示同意且有待批命令在案 → 本回合放行逐字一致的命令
+  const highRiskApproval = short.length <= MERCY_SHORT && /同意|批准|允许|可以|没问题|通过|执行吧|照办|ok|yes/i.test(short);
+  if (highRiskApproval && state.highRiskCmd) {
+    audit(sid, "high-risk-granted", { level: null, evidence: `批示原文: ${short} | 待批命令: ${String(state.highRiskCmd).slice(0, 120)}`, pardon: true });
+  }
+
   // 43条 状态重置核验：上一回合残留 → 记档报告后清理（本事件随后统一重置）
   const residues = [];
   if ((state.turnCount || 0) > 0) residues.push(`turnCount=${state.turnCount}`);
@@ -698,6 +709,7 @@ if (mode === "reset") {
     stopBlocked: false,
     mercy,
     pushAuthorized: pushAuth, // 2.3.0：推送批示按回合生效
+    highRiskOk: highRiskApproval && !!state.highRiskCmd, // 2.4.0：高危批示按回合生效，须有待批命令
     violations: 0,
     forcedInvestigate: false,
     probation: false,
@@ -817,6 +829,22 @@ if (mode === "pre") {
   }
 
   const mutating = isMutating(tool, ti, handoff);
+
+  // 2.4.0 高危命令闸：完全访问下 rm 类命令仍须先申请、人类批示，批准后逐字一致才放行
+  if (tool === "Bash" && HIGH_RISK_RE.test(String(ti.command || ""))) {
+    const cmdStr = String(ti.command || "");
+    if (state.highRiskOk && state.highRiskCmd === cmdStr) {
+      audit(sid, "high-risk-approved", { level: null, evidence: `2.4.0 已批高危命令执行 ${cmdStr.slice(0, 120)}` });
+    } else {
+      state.highRiskCmd = cmdStr.slice(0, 300);
+      saveState(path, state);
+      audit(sid, "high-risk-request", { level: null, evidence: `2.4.0 高危命令待批 ${cmdStr.slice(0, 120)}` });
+      process.stderr.write(
+        "[高危命令闸]删除/强推/清盘/发布类命令即使完全访问也须人类审批。先输出【高危命令申请】：命令原文＋目标与影响＋理由，等批示（同意/批准）。批示后原样重发同一命令即放行；改动命令须重新申请。"
+      );
+      process.exit(2);
+    }
+  }
 
   // 2.2.0 三.1：污染核实闸——上轮工具输出与指令参数矛盾且未核实前，首个改动类先拦一次（一次性，重试放行）
   if (state.pollutionFlagged && mutating) {
