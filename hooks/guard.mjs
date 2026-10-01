@@ -86,9 +86,12 @@ const DANGEROUS_PATTERNS = new RegExp([
   "shutil\\.rmtree",
   "drop\\s+table",
   "truncate\\s+table",
-  "git\\s+push\\b(?!\\s+--dry-run)",
+  "git\\s+(?:-{1,2}[A-Za-z-][\\S]*\\s+\\S+\\s+)*push\\b(?!\\s+--dry-run)",
   "git\\s+reset\\s+[^&|;]*--hard",
   "git\\s+clean\\s+[^&|;]*-\\w*f",
+  "(?:sudo\\s+)?\\brm\\b\\s+--recursive",
+  "\\brmSync\\s*\\([^&|;]*recursive",
+  "\\brmdirSync\\s*\\([^&|;]*recursive",
   "chmod\\s+[^&|;]*\\b777\\b",
   "chmod\\s+-R",
   "\\bchown\\b",
@@ -111,7 +114,7 @@ const DANGEROUS_PATTERNS = new RegExp([
   "\\bdd\\s+[^&|;]*of=/dev/",
   "\\bshutdown\\b",
 ].join("|"), "i");
-const SQL_NOWHERE_RE = /(^|[;]\s*)(delete\s+from|update)\s+[\w`."]+\s*(set\b|;|$)/i; // 2.4.0：无 where 的 DELETE/UPDATE
+const SQL_NOWHERE_RE = /\bdelete\s+from\s+[\w`."]+|\bupdate\s+[\w`."]+\s+set\b/i; // 2.4.0：无 where 的 DELETE FROM / UPDATE...SET（结合全命令无 where 判定）
 const SCRIPT_FILE_RE = /\.(sh|ps1|bat|cmd|py|pl|rb|mjs|cjs|js)$/i; // 2.4.0：脚本包装检测范围
 function isDangerousCmd(cmd) {
   const c = String(cmd || "");
@@ -1068,6 +1071,10 @@ if (mode === "post" || mode === "postfail") {
 
   const tool = input.tool_name || "";
   const ti = input.tool_input || {};
+  // 2.4.1 结构优化：响应内容单次采样，进度/污染/追责/摘要/强制场景五处检查共用（此前重复遍历 5 次）
+  const respProbe = { parts: [], total: 0 };
+  if (mode === "post") collectStrings(input.tool_response ?? {}, respProbe, 200000);
+  const respText = respProbe.parts.join("\n");
 
   // 取证销账：L2 强制取证由一次成功调查解除
   if (state.forcedInvestigate && mode === "post" && isInvestigation(tool, ti)) {
@@ -1107,6 +1114,12 @@ if (mode === "post" || mode === "postfail") {
           via: fp.sha ? "mtime+size+sha" : "mtime+size+git",
         };
         state.caseCache = cc;
+        const ccKeys = Object.keys(cc);
+        if (ccKeys.length > CASE_MAX_ROWS) {
+          // 2.4.1 极限加固：卷宗缓存上限裁剪（按取证时间淘汰最旧），防长会话无界增长
+          ccKeys.sort((a, b) => (cc[a].readAt || 0) - (cc[b].readAt || 0));
+          for (const k of ccKeys.slice(0, ccKeys.length - CASE_MAX_ROWS)) delete cc[k];
+        }
         const pDir = projectDir();
         if (pDir) saveCaseRecords(pDir, { ...loadCaseRecords(casePath(pDir)), ...cc });
       } catch {}
@@ -1116,9 +1129,7 @@ if (mode === "post" || mode === "postfail") {
   // ===== 动态预算：进度检测引擎 =====
   let progress = false;
   if (mode === "post") {
-    const probe = { parts: [], total: 0 };
-    collectStrings(input.tool_response ?? {}, probe, 20000);
-    const contentSig = probe.parts.join("¦").slice(0, 1500);
+    const contentSig = respText.slice(0, 1500);
     const inputSig = callHash(input);
     progress =
       (tool === "Write" || tool === "Edit") ||
@@ -1173,9 +1184,7 @@ if (mode === "post" || mode === "postfail") {
   // 58条 上下文污染检测：工具输出与指令矛盾 → 停止使用该输出并报告人类
   if (!reason && mode === "post" && tool === "Bash") {
     const cmd = String(ti.command || "");
-    const probeOut = { parts: [], total: 0 };
-    collectStrings(input.tool_response ?? {}, probeOut, 100000);
-    const outLines = probeOut.parts.join("\n").split("\n").filter((l) => l.trim() !== "");
+    const outLines = respText.split("\n").filter((l) => l.trim() !== "");
     const hm = cmd.match(/\bhead\s+(?:-n\s*(\d{1,6})|-(\d{1,6}))\b/);
     if (hm) {
       const n = parseInt(hm[1] || hm[2], 10);
@@ -1202,21 +1211,17 @@ if (mode === "post" || mode === "postfail") {
 
   // 巡视：Bash/Grep 巨量输出事后追责
   if (!reason && (tool === "Bash" || tool === "Grep")) {
-    const probe = { parts: [], total: 0 };
-    collectStrings(input, probe, 200000);
-    if (probe.total > OUTPUT_GATE_BYTES) {
+    if (respProbe.total > OUTPUT_GATE_BYTES) {
       state.dumpCount = (state.dumpCount || 0) + 1;
-      audit(sid, "scold-dump", { level: null, evidence: `${tool} 输出 ${Math.round(probe.total / 1024)}KB` });
+      audit(sid, "scold-dump", { level: null, evidence: `${tool} 输出 ${Math.round(respProbe.total / 1024)}KB` });
       reason =
-        `体积刺客：${tool} 输出 ${Math.round(probe.total / 1024)}KB 已入上下文。下次先 head/tail/wc/grep 过滤（累计 ${state.dumpCount} 次）。`;
+        `体积刺客：${tool} 输出 ${Math.round(respProbe.total / 1024)}KB 已入上下文。下次先 head/tail/wc/grep 过滤（累计 ${state.dumpCount} 次）。`;
     }
   }
 
   // ===== 2.3.0 二/五：子代理摘要格式校验（只收【子代理摘要】，≤200字）=====
   if (!reason && mode === "post" && tool === "Agent") {
-    const probeSum = { parts: [], total: 0 };
-    collectStrings(input.tool_response ?? {}, probeSum, 20000);
-    const sumText = probeSum.parts.join(" ");
+    const sumText = respText;
     const fmtOk =
       /【子代理摘要】/.test(sumText) &&
       /任务[:：]/.test(sumText) &&
@@ -1236,9 +1241,7 @@ if (mode === "post" || mode === "postfail") {
 
   // ===== 2.3.0 三/五：强制委派场景检测（该委派不委派 → KPI-5 提醒；已委派 → KPI+5 一次）=====
   if (!reason && mode === "post") {
-    const probeSc = { parts: [], total: 0 };
-    collectStrings(input.tool_response ?? {}, probeSc, 50000);
-    const scLines = probeSc.parts.join("\n").split("\n").map((l) => l.trim()).filter(Boolean);
+    const scLines = respText.split("\n").map((l) => l.trim()).filter(Boolean);
     const scPaths = scLines.filter((l) => /[\/\\]/.test(l) && l.length <= 200 && !/^(total|\.\.?|d[-rwx]|-[-rwx])/.test(l));
     const scDirs = new Set(scPaths.map((l) => l.replace(/[\/\\][^\/\\]*$/, "")));
     let scenario = "";
