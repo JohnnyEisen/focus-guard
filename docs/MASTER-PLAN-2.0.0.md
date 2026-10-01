@@ -2,7 +2,7 @@
 
 > 原则：一次检测全程复用，卷宗留痕指纹防伪，跨平台适配不重复取证
 >
-> （工程总纲，非法条；对应引擎 `hooks/guard.mjs` v2.0.0）
+> （工程总纲，非法条；对应引擎 `hooks/guard.mjs` v2.5.1；卷宗结构沿用 2.0.0 设计）
 
 ## 一、核心定位
 
@@ -35,7 +35,7 @@
 
 ## 三、环境检测（会话级，一次检测全程生效）
 
-检测时机：SessionStart 执行一次，写入 state.envCache，envChecked = true。UserPromptSubmit 不重检。仅当明确探测到 shell 变化时重检。
+检测时机：SessionStart 执行一次，写入 `state.envCache`；`envCache` 非空即代表"已检测"，不再另设布尔标记（原 `envChecked` 只写不读、且可能与缓存不一致，2.5.1 删除）。UserPromptSubmit 不重检。仅当明确探测到 shell 变化时重检。检测结果同时写入卷宗【一】的环境声明行，供人类直接查阅（2.5.1）。
 
 检测项：
 

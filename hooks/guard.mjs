@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// focus-guard 护栏脚本 v2.0.0 — 卷宗体系（总纲 2.0.0）+ 《AI 履职执法模型 v3.0》+ 动态预算
+// focus-guard 护栏脚本 v2.5.1 — 卷宗体系（总纲 2.0.0）+ 《AI 履职执法模型 v3.0》+ 动态预算
 // 一、空气层：不查词、不打扰（违禁词扫描已废除）
-// 二、触发层：行为违规即罚，梯度处罚 L1-L6；触发④=动态预算+进度检测；双预算池(20条)
+// 二、触发层：行为违规即罚，梯度处罚 L1-L6；触发④=动态预算+进度检测；三预算池(侦查/执行/委托，20条)
 // 三、卷宗层(2.0)：.ai/CASE_FILE.md 四册（环境声明/依赖声明/侦查记录/额度台账）
 //     会话级环境检测一次全程复用（仅 shell 变化时重检）；跨回合取证指纹
 //     （mtime+size+SHA-256≤200KB+git 脏态）防伪；自适应 TTL+依赖声明/人工标注覆盖；
@@ -33,19 +33,24 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.5.0"; // 42条：部署版本核验基准（2.4.1 时曾漏升引擎号，本轮一并修正）
+const ENGINE_VERSION = "2.5.1"; // 42条：部署版本核验基准（须与五处清单及本文件头注释一致，见验收"版本一致性"用例）
 // 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
 // 2.0.2 DSH 版：csproj/sln 列入风险文件备案（C# 项目配置与 package.json 同级）
 // 2.2.0 正面指引版：git push 人类专属闸（二.3/五.3，本地 commit AI 可做、推送人类 UI 执行）
+//   （该口径已于 2.4.0 废止：git push 并入高危特征库，走【高危申请】审批单，y 放行本次由 AI 执行、n 彻底阻断）
 //   + 污染核实闸（三.1，输出矛盾后首个改动类先拦一次，要求先出【污染核实】声明）
 //   + 改动前自动备份 .ai/backup/（一.2，无 .git 工作区的物理回滚依据）+ 熔断出口提示经验固化 PATTERNS.md（六.1）
-// 2.3.0 委派条例：委托池独立核算（默认20次，不占执行池，批示『追加委托额度』+10）+ 子代理摘要格式校验
+// 2.3.0 委派条例：委托池独立核算（默认20次，不占执行池，批示『追加额度』执行/侦查/委托三池各+10）+ 子代理摘要格式校验
 //   （【子代理摘要】四字段≤200字，否则拒收）+ 强制委派场景检测（全库搜索/大文档/批量处理，未委派 KPI-5）
 //   + 熔断期启动子代理=越权绕行（L4记档+L5降权）+ 委派 KPI（+5/+3/-5/-3）
 // 2.4.0 高危命令闸：完全访问下 rm 类命令仍须【高危命令申请】+人类批示，批准后逐字一致才放行；放松日常+刚性高危
 // 2.5.0 DSH 硬拦截：官方桥 dsh-hooks-claude-code 直接运行本 hooks.json（exit 2 硬拦/ask 审批/stderr 原文透传），
 //   取代 fire-and-forget 监察模式；Stop 载荷无收尾文本 → 锚点/审批单校验按 DSH 签名降级审计（防桥接续跑死循环）
-// 2.4.1 补记：特征库加固与结构优化时引擎号漏升（manifest 2.4.1 / 引擎 2.4.0 漂移过一个版本），2.5.0 对齐
+//   （2.4.1 特征库加固与结构优化时引擎号曾漏升：manifest 2.4.1 / 引擎 2.4.0，2.5.0 已对齐）
+// 2.5.1 盘点修复版：①假留痕防线——AUDIT/卷宗【三】【四】/改动前备份写失败一律上 stderr，禁止静默丢记录；
+//   ②卷宗【一】环境声明落卷（此前仅占位符，人类无从查阅）；③42条源码路径适配"根即插件"布局、
+//   市场源扫描不再写死 default 工作区；④58条路径查重改判"首 token 是路径"，避免 git 警告行误报且不放过裸相对路径；
+//   ⑤委派 KPI 入额度台账并跨阈值提醒一次；⑥版本一致性自检用例（五处清单+引擎号+本头注释）
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -76,9 +81,8 @@ const EVIDENCE_ANCHORS = /:\d+|日志原文|报错|HANDOFF\.md|交接报告|【�
 const RISKY_FILE_RE = /(^|\/)(package(-lock)?\.json|[^\/]*\.lock|tsconfig\.json|AGENTS\.md|CLAUDE\.md|Dockerfile|[^\/]*\.env[^\/]*|zcode\.json|[^\/]*\.csproj|[^\/]*\.sln)$|\.github\/|\.zcode-plugin\//i;
 const MUTATING_BASH_RE = /(^|[;&|]\s*)(rm|rmdir|mv|del|rd|git\s+(add|commit|push|pull|merge|rebase|reset|checkout|clean|restore)|npm\s+(install|uninstall|ci)|pip3?\s+(install|uninstall)|yarn\s+(add|remove|install)|pnpm\s+(add|remove|install)|chmod|chown|kill|taskkill|truncate|dd|mkfs|mkdir|touch|Set-Content|Add-Content|Remove-Item|New-Item|Copy-Item|Move-Item)\b/i;
 const FILE_REDIRECT_RE = /(^|\s)>{1,2}(?!\s*&)/;
-const PUSH_RE = /\bgit\s+(?:-[A-Za-z]\S*\s+)*(?:-c\s+\S+\s+)*push\b/i; // 2.2.0：git push（含 -C/-c 传参），--dry-run 例外
 const BACKUP_KEEP = 100; // 2.2.0：.ai/backup/ 最大保留份数（超出淘汰最旧）
-const DELEGATE_DEFAULT = 20; // 2.3.0：委托池默认额度（独立于执行池，批示『追加委托额度』+10）
+const DELEGATE_DEFAULT = 20; // 2.3.0：委托池默认额度（独立于执行池；批示『追加额度』三池各+10）
 // 2.4.0 高危命令特征库（六类：破坏性删除/强制推送与历史覆盖/系统权限与配置篡改/全局依赖安装/对外发送与发布/数据库影响）
 // 即使完全访问（yolo）也须人类实时审批；普通单文件 rm、常规构建不在此列
 const DANGEROUS_PATTERNS = new RegExp([
@@ -176,21 +180,29 @@ function auditTarget(sid) {
 }
 
 function audit(sid, trigger, opts = {}) {
+  const record = JSON.stringify({
+    ts: new Date().toISOString(),
+    session: sid,
+    action: opts.action || trigger,
+    trigger: opts.trigger ?? trigger,
+    level: opts.level ?? null,
+    evidence: String(opts.evidence || "").slice(0, 200),
+    pardon: !!opts.pardon,
+  }) + "\n";
+  // 2.5.1 假留痕防线：工作区写失败 → 回退系统临时目录；仍失败 → stderr 一行可见，绝不无声丢执法记录
+  for (const p of [auditTarget(sid), join(tmpdir(), `focus-guard-${sid}-AUDIT.log`)]) {
+    try {
+      mkdirSync(dirname(p), { recursive: true });
+      appendFileSync(p, record);
+      return;
+    } catch {}
+  }
+  noteFail(sid, "AUDIT.log（工作区与临时目录均写入失败）");
+}
+
+function noteFail(sid, what) {
   try {
-    const p = auditTarget(sid);
-    mkdirSync(dirname(p), { recursive: true });
-    appendFileSync(
-      p,
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        session: sid,
-        action: opts.action || trigger,
-        trigger: opts.trigger ?? trigger,
-        level: opts.level ?? null,
-        evidence: String(opts.evidence || "").slice(0, 200),
-        pardon: !!opts.pardon,
-      }) + "\n"
-    );
+    process.stderr.write(`[留痕告急]${what}，会话 ${sid} 的本次记录未落盘。\n`);
   } catch {}
 }
 
@@ -206,7 +218,8 @@ function projectDir() {
 
 // ============ 2.2.0 正面指引（一.2）：改动前自动备份 ============
 // 回滚按环境自动选：有 .git → git restore；没有 → 本函数产出的 .ai/backup/ 物理副本覆盖还原。
-// 备份改动前的现状，保留最近 BACKUP_KEEP 份（超出淘汰最旧），失败静默（备份不可阻断正常执法）。
+// 备份改动前的现状，保留最近 BACKUP_KEEP 份（超出淘汰最旧）。>200KB 的文件有意跳过（避免拖慢大写入，
+// README 已注明此上限）；失败不阻断执法，但一律上 stderr——静默会让 AI 误以为存在可回滚副本（2.5.1 假留痕防线）。
 function backupBeforeEdit(absPath) {
   try {
     const dir = projectDir();
@@ -231,7 +244,9 @@ function backupBeforeEdit(absPath) {
       all.sort((a, b) => a[1] - b[1]);
       for (let i = 0; i < all.length - BACKUP_KEEP; i++) rmSync(all[i][0], { force: true });
     }
-  } catch {}
+  } catch {
+    noteFail(sid, `改动前备份 ${absPath}（无副本可回滚，改动仍会放行）`);
+  }
 }
 
 function loadState(path) {
@@ -252,19 +267,16 @@ function loadState(path) {
       readSet: {},
       turnPrompt: "",
       taskBudget: BUDGET_DEFAULT,
-      keywordBudget: BUDGET_DEFAULT,
       declaredBudget: 0,
       effectiveCalls: 0,
       ineffCalls: 0,
       stalledStreak: 0,
       lastSig: "",
       lastInput: "",
-      totalCalls: 0,
       invCalls: 0,
       invCap: INV_POOL_DEFAULT,
       invWarned: false,
-      envCache: null,
-      envChecked: false,
+      envCache: null, // 环境检测结果即"已检测"的单一事实源（原 envChecked 布尔只写不读且可能与缓存不一致，2.5.1 删除）
       caseCache: {},
       taskInitial: BUDGET_DEFAULT,
       pollutionFlagged: false,
@@ -278,6 +290,7 @@ function loadState(path) {
       delegateUsed: 0, // 2.3.0：委托池累计消耗
       delegated: false, // 2.3.0：本任务是否已委派过
       kpi: 0, // 2.3.0：委派 KPI 累计分
+      kpiLowReported: false, // 2.5.1：KPI 跌破 -10 只提醒一次（回升后再跌破可再次提醒）
       kpiScolded: {}, // 2.3.0：每场景每任务只提醒一次
       kpiDelegatedAwarded: false, // 2.3.0：+5 每任务一次
       editedFiles: {}, // 2.3.0：本任务改过的文件集合（批量场景判定）
@@ -366,14 +379,14 @@ function detectEnv() {
 
 const CASE_TEMPLATE =
   "# FocusGuard 卷宗（CASE_FILE）\n\n" +
-  "> 引擎自动维护【三】【四】；【二】由人工填写。请勿手工重排结构。【三】TTL 列留空=自适应，人工填写（如 30天/1小时）=覆盖。\n\n" +
-  "### 【一】环境声明（会话启动检测，全程复用）\n\n（引擎留存于会话 state.envCache，此处不展开）\n\n" +
+  "> 引擎自动维护【一】【三】【四】；【二】由人工填写。请勿手工重排结构。【三】TTL 列留空=自适应，人工填写（如 30天/1小时）=覆盖。\n\n" +
+  "### 【一】环境声明（会话启动检测，全程复用）\n\n（SessionStart 自动写入检测结果并全程复用，人类可在此直接查阅）\n\n" +
   "### 【二】项目依赖声明（人工填写，可覆盖自动 TTL）\n\n" +
   "| 依赖名 | 版本 | 安装路径 | 更新频率 | 信任TTL | 备注 |\n|---|---|---|---|---|---|\n\n" +
   "### 【三】侦查取证记录（插件自动追加）\n\n" +
   "| 文件名 | 读取时间 | mtime | size | SHA-256 | 变更历史 | TTL | 验证方式 |\n|---|---|---|---|---|---|---|---|\n\n" +
   "### 【四】工作额度台账\n\n" +
-  "| 任务 | 初始额度 | 已用额度 | 剩余额度 | 有效调用 | 无效调用 | 更新时间 |\n|---|---|---|---|---|---|---|\n";
+  "| 任务 | 初始额度 | 已用额度 | 剩余额度 | 有效调用 | 无效调用 | 更新时间 | KPI |\n|---|---|---|---|---|---|---|---|\n";
 
 function casePath(projDir) {
   return join(projDir, ".ai", "CASE_FILE.md");
@@ -449,7 +462,9 @@ function saveCaseRecords(projDir, records) {
     const tmp = p + ".tmp";
     writeFileSync(tmp, t);
     renameSync(tmp, p);
-  } catch {}
+  } catch {
+    noteFail(sid, "卷宗【三】侦查记录");
+  }
 }
 
 function saveLedger(projDir, state) {
@@ -459,13 +474,15 @@ function saveLedger(projDir, state) {
     const eff = state.effectiveCalls || 0;
     const inv = state.invCalls || 0;
     const used = eff + inv;
-    const row = `| ${new Date().toISOString().slice(0, 16)} | ${state.taskInitial ?? state.taskBudget ?? BUDGET_DEFAULT} | ${used} | ${Math.max(0, (state.taskBudget || BUDGET_DEFAULT) - used)} | ${eff} | ${state.ineffCalls || 0} | ${new Date().toISOString()} |`;
-    const table = ["| 任务 | 初始额度 | 已用额度 | 剩余额度 | 有效调用 | 无效调用 | 更新时间 |", "|---|---|---|---|---|---|---|", row].join("\n");
+    const row = `| ${new Date().toISOString().slice(0, 16)} | ${state.taskInitial ?? state.taskBudget ?? BUDGET_DEFAULT} | ${used} | ${Math.max(0, (state.taskBudget || BUDGET_DEFAULT) - used)} | ${eff} | ${state.ineffCalls || 0} | ${new Date().toISOString()} | KPI ${state.kpi || 0} |`;
+    const table = ["| 任务 | 初始额度 | 已用额度 | 剩余额度 | 有效调用 | 无效调用 | 更新时间 | KPI |", "|---|---|---|---|---|---|---|---|", row].join("\n");
     t = t.replace(/### 【四】[\s\S]*?(?=\n### |\n## |$)/, () => "### 【四】工作额度台账\n\n" + table + "\n");
     const tmp = p + ".tmp";
     writeFileSync(tmp, t);
     renameSync(tmp, p);
-  } catch {}
+  } catch {
+    noteFail(sid, "卷宗【四】额度台账");
+  }
 }
 
 function fingerprint(absPath) {
@@ -615,9 +632,18 @@ if (mode === "start") {
   // 2.0 卷宗载入：重建 readSetCache 与 TTL 表（总纲七）
   const st = loadState(path);
   st.envCache = env;
-  st.envChecked = true;
   const projDir = projectDir();
-  if (projDir) st.caseCache = loadCaseRecords(ensureCaseFile(projDir));
+  if (projDir) {
+    st.caseCache = loadCaseRecords(ensureCaseFile(projDir));
+    try {
+      // 2.5.1：卷宗【一】环境声明落卷（此前仅占位符，人类无法查阅——盘点报告半成品项）
+      const cp = casePath(projDir);
+      let t = readFileSync(cp, "utf8");
+      const envRow = `- OS=${env.os} / Shell=${env.shellIdKey} / 大小写=${env.caseSensitive === false ? "不敏感" : "敏感"} / 编码=${env.encoding || "-"} / 检测于 ${new Date().toISOString()}`;
+      t = t.replace(/### 【一】[\s\S]*?(?=\n### |\n## |$)/, () => `### 【一】环境声明（会话级检测，全程复用）\n\n${envRow}\n`);
+      writeFileSync(cp, t);
+    } catch {}
+  }
   saveState(path, st);
   let ctx = SESSION_RULES;
   if (projDir) {
@@ -628,7 +654,7 @@ if (mode === "start") {
       audit(sid, "handover-inspect", { level: null, evidence: "36条 交叉巡视：发现 HANDOFF.md" });
     } catch {}
     // 42条 部署版本核验：运行引擎 vs 工作区源码
-    for (const rel of ["focus-guard/hooks/guard.mjs", "plugins/focus-guard/hooks/guard.mjs"]) {
+    for (const rel of ["hooks/guard.mjs", "focus-guard/hooks/guard.mjs", "plugins/focus-guard/hooks/guard.mjs"]) {
       try {
         const m = readFileSync(join(projDir, rel), "utf8").slice(0, 400).match(/v(\d+\.\d+\.\d+)/);
         if (m && m[1] !== ENGINE_VERSION) {
@@ -655,13 +681,17 @@ if (mode === "start") {
       const regVer = String(basename(String(entry.installPath || "")));
       let srcVer = "";
       try {
-        srcVer =
-          JSON.parse(
-            readFileSync(
-              join(home, ".zcode", "workspace", "default", "plugins", "focus-guard", "marketplace.json"),
-              "utf8"
-            )
-          ).version || "";
+        // 2.5.1：扫描全部工作区取市场源版本（不再写死 "default" 工作区名）
+        const wsRoot = join(home, ".zcode", "workspace");
+        for (const ws of readdirSync(wsRoot)) {
+          try {
+            srcVer =
+              JSON.parse(
+                readFileSync(join(wsRoot, ws, "plugins", "focus-guard", "marketplace.json"), "utf8")
+              ).version || "";
+            if (srcVer) break;
+          } catch {}
+        }
       } catch {}
       const drift = [];
       if (regVer && regVer !== ENGINE_VERSION) drift.push(`注册表v${regVer}`);
@@ -703,7 +733,6 @@ if (mode === "reset") {
   // 总纲三：仅当明确探测到 shell 变化时重检环境
   if (state.envCache && state.envCache.shellIdKey && state.envCache.shellIdKey !== quickShellId()) {
     state.envCache = detectEnv();
-    state.envChecked = true;
     audit(sid, "env-redetect", { level: null, evidence: `shell 变化 → 重检为 ${state.envCache.shell}` });
   }
 
@@ -757,13 +786,12 @@ if (mode === "reset") {
   if (residues.length) audit(sid, "residue-check", { level: null, evidence: `43条 残留(已清理): ${residues.join(" ")}` });
 
   const kw = KEY50_RE.test(promptText) ? 50 : KEY15_RE.test(promptText) ? 15 : BUDGET_DEFAULT;
-  state.keywordBudget = kw;
   state.taskBudget = Math.max(kw, state.declaredBudget || 0, state.taskBudget || BUDGET_DEFAULT);
   state.taskInitial = state.taskBudget;
   state.ineffCalls = 0;
 
   saveState(path, {
-    ...state, // envCache/envChecked/caseCache（侦查缓存）随 spread 保留；kpi/delegateUsed（考核与委托台账）跨回合保留
+    ...state, // envCache/caseCache（侦查缓存）随 spread 保留；kpi/delegateUsed（考核与委托台账）跨回合保留
     turnCount: 0,
     seen: {},
     fused: false,
@@ -784,7 +812,6 @@ if (mode === "reset") {
     turnPrompt: promptText.slice(0, 500),
     taskBudget: state.taskBudget,
     taskInitial: state.taskInitial,
-    keywordBudget: kw,
     lastSig: "",
     lastInput: "",
   });
@@ -846,7 +873,7 @@ if (mode === "pre") {
     if ((state.delegateBudget ?? DELEGATE_DEFAULT) <= 0) {
       audit(sid, "delegate-exhausted", { level: null, evidence: `2.3.0 委托池用尽 剩余=0 累计=${state.delegateUsed || 0}` });
       process.stderr.write(
-        "[委托池用尽]子代理额度已用完（默认20次，独立于执行池）。请批示『追加委托额度』(+10)，或主会话自行收敛。"
+        "[委托池用尽]子代理额度已用完（默认20次，独立于执行池）。请批示『追加额度』（执行/侦查/委托三池各+10），或主会话自行收敛。"
       );
       process.exit(2);
     }
@@ -1068,7 +1095,6 @@ if (mode === "post" || mode === "postfail") {
   let reason = null;
 
   state.turnCount = (state.turnCount || 0) + 1;
-  state.totalCalls = (state.totalCalls || 0) + 1;
   const hash = callHash(input);
   state.seen = state.seen || {};
   state.seen[hash] = (state.seen[hash] || 0) + 1;
@@ -1145,7 +1171,7 @@ if (mode === "post" || mode === "postfail") {
 
   const inv = isInvestigation(tool, ti);
   if (progress) {
-    // 20条 双预算池：侦查(只读)与执行(改动)分池计数，不互相挤占
+    // 20条 三预算池：侦查(只读)/执行(改动)/委托(子代理，pre 阶段核算) 三池分列，不互相挤占
     if (tool === "Agent") {
       // 2.3.0：委派不占主会话执行池（委托池已在 pre 核算），仅计入进度
       state.stalledStreak = 0;
@@ -1203,7 +1229,10 @@ if (mode === "post" || mode === "postfail") {
       let dup = "";
       for (const l of outLines) {
         if (seen.has(l)) { dup = l; break; }
-        if (/[\/\\]/.test(l)) seen.add(l);
+        // 2.5.1：判定标准为"首 token 本身是路径"（./x/a.js、hooks/guard.mjs、C:\x\y 均算）：
+        // 既排除 git 警告/说明等散文行（首 token 形如 warning:），又不放过 git ls-files 的裸相对路径
+        const tok = l.trim().split(/\s+/)[0] || "";
+        if (/[\/\\]/.test(tok) && !/[:：]$/.test(tok)) seen.add(l);
       }
       if (dup) {
         state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
@@ -1390,6 +1419,19 @@ if (mode === "stop") {
       state.fused = true;
       state.violations = Math.max(state.violations || 0, 3);
       audit(sid, "shuanggui-declared", { level: 3, evidence: formalFuse ? "明示熔断" : `连续 ${state.unknownStreak} 次未知声明` });
+      // 2.5.1：熔断时确保经验库存在（79条：解除后 AI 追加经验，卡点时 Grep 检索）
+      if (formalFuse) {
+        try {
+          const pd = projectDir();
+          if (pd) {
+            const pat = join(pd, ".ai", "PATTERNS.md");
+            if (!existsSync(pat)) {
+              mkdirSync(dirname(pat), { recursive: true });
+              writeFileSync(pat, "# PATTERNS 经验库\n\n> 格式：[环境:OS] [任务:类型] 以后遇到 X 必须先做 Y。熔断/返工后由 AI 追加；新任务不预读，卡点时 Grep 检索（79条）。\n");
+            }
+          }
+        } catch {}
+      }
     }
     state.turnCount = 0;
     saveState(path, state);
@@ -1462,12 +1504,22 @@ if (mode === "stop") {
 
   state.stopBlocked = false;
   state.turnCount = 0;
+  // 2.5.1：委派 KPI 兑现入口——跌破阈值提醒一次并落 AUDIT（考核等次/奖惩等法条级扩展属平台暂缓项）。
+  // 必须在 saveState 之前判定，否则 kpiLowReported 标记不落盘，会每次收尾重复告警。
+  if ((state.kpi || 0) <= -10) {
+    if (!state.kpiLowReported) {
+      state.kpiLowReported = true;
+      audit(sid, "kpi-low", { level: null, evidence: `委派 KPI ${state.kpi}：强制委派场景累计失分，下任务请优先 Agent 委派（委托池独立 20 次）` });
+    }
+  } else if (state.kpiLowReported) {
+    state.kpiLowReported = false; // KPI 回升到阈值以上后，再次跌破可重新提醒
+  }
   saveState(path, state);
   // 2.0 总纲七：更新工作额度台账到卷宗
   const pDir = projectDir();
   if (pDir) saveLedger(pDir, state);
   // 回合诊断：与 reset-fired 对照，定位 UserPromptSubmit 是否触发
-  audit(sid, "stop-fired", { level: null, evidence: `turnCalls=${input && input.stop_hook_active !== undefined ? "有" : "?"} eff=${state.effectiveCalls || 0} inv=${state.invCalls || 0} budget=${state.taskBudget}` });
+  audit(sid, "stop-fired", { level: null, evidence: `turnCalls=${input && input.stop_hook_active !== undefined ? "有" : "?"} eff=${state.effectiveCalls || 0} inv=${state.invCalls || 0} budget=${state.taskBudget} kpi=${state.kpi || 0}` });
   process.exit(0);
 }
 

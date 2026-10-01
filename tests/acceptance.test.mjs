@@ -160,7 +160,7 @@ describe("体积刺客", () => {
   });
 });
 
-describe("双预算池（20条）", () => {
+describe("三预算池（20条）", () => {
   test("侦查调用进侦查池，不挤占执行池", () => {
     const run = makeRunner("dualpool");
     run("reset", { prompt: "看看情况" });
@@ -224,6 +224,28 @@ describe("上下文污染检测（58条）", () => {
     });
     assert.ok(r.out.includes("上下文污染"));
   });
+
+  test("路径查重判定（2.5.1）：git ls-files 裸相对路径重复仍检出；git 警告散文行不误报", () => {
+    const run = makeRunner("duppath-bare");
+    run("reset", { prompt: "看看情况" });
+    const bare = run("post", {
+      tool_name: "Bash",
+      tool_input: { command: "git ls-files" },
+      tool_response: { content: "hooks/guard.mjs\ndocs/RULES.md\nhooks/guard.mjs" }, // 无 ./ 前缀
+    });
+    assert.ok(bare.out.includes("上下文污染"), "裸相对路径重复必须检出（旧判定只认以路径开头的行，会漏检）");
+    run("reset", { prompt: "看看情况" });
+    const prose = run("post", {
+      tool_name: "Bash",
+      tool_input: { command: "git ls-files" },
+      tool_response: {
+        content:
+          "warning: in the working copy of 'a/b.txt', LF will be replaced by CRLF\n" +
+          "warning: in the working copy of 'a/b.txt', LF will be replaced by CRLF",
+      },
+    });
+    assert.equal(prose.out, "", "git 警告散文行首 token 不是路径，不得误报重复路径");
+  });
 });
 
 describe("回合与部署卫生", () => {
@@ -270,9 +292,10 @@ describe("卷宗体系（总纲 2.0.0）", () => {
     const dir = freshDir();
     run("start", { session_id: "env-det" }, { ZCODE_PROJECT_DIR: dir });
     const s = stateOf("env-det");
-    assert.equal(s.envChecked, true);
+    assert.ok(s.envCache, "envCache 非空即视为已检测（2.5.1 起取消冗余 envChecked 布尔）");
     assert.equal(s.envCache.os, process.platform);
     assert.ok(s.envCache.shellIdKey);
+    assert.ok(caseFileOf(dir).includes("Shell=")); // 2.5.1 卷宗【一】环境声明落卷
     assert.ok(existsSync(join(dir, ".ai", "CASE_FILE.md")));
     rmSync(dir, { recursive: true, force: true });
   });
@@ -647,7 +670,7 @@ describe("子代理委派（v2.3.0）", () => {
     assert.ok(auditOf("del-D").includes("kpi-delegated"));
   });
 
-  test("委托池用尽拒绝委派，批示『追加委托额度』+10 后恢复", () => {
+  test("委托池用尽拒绝委派；批示『追加额度』+10 恢复（旧称『追加委托额度』同样生效）", () => {
     const run = makeRunner("del-E");
     run("reset", { prompt: "看看情况" });
     writeState("del-E", { delegateBudget: 0, delegateUsed: 20 });
@@ -658,6 +681,23 @@ describe("子代理委派（v2.3.0）", () => {
     assert.equal(stateOf("del-E").delegateBudget, 10); // 跨回合保留，批示 +10，不自动回满
     assert.equal(run("pre", { tool_name: "Agent", tool_input: { description: "第21次委派" } }).rc, 0);
     assert.equal(stateOf("del-E").delegateUsed, 21);
+  });
+
+  test("KPI 跌破 -10 只提醒一次（kpi-low 不刷屏），回升后再跌破可重报", () => {
+    const run = makeRunner("kpi-low");
+    run("reset", { prompt: "看看情况" });
+    writeState("kpi-low", { kpi: -15 });
+    run("stop", { response: "根据 r1.txt:5 结论成立" });
+    run("stop", { response: "根据 r1.txt:5 结论成立" });
+    const lowHits = () => auditOf("kpi-low").split("\n").filter((l) => l.includes('"kpi-low"')).length;
+    assert.equal(lowHits(), 1, "同一阈值区间内不得每次收尾重复告警");
+    assert.equal(stateOf("kpi-low").kpiLowReported, true);
+    writeState("kpi-low", { kpi: 0 }); // KPI 回升
+    run("stop", { response: "根据 r1.txt:5 结论成立" });
+    assert.equal(stateOf("kpi-low").kpiLowReported, false);
+    writeState("kpi-low", { kpi: -12 }); // 再次跌破
+    run("stop", { response: "根据 r1.txt:5 结论成立" });
+    assert.equal(lowHits(), 2);
   });
 });
 
@@ -821,5 +861,53 @@ describe("极限场景（v2.4.1）", () => {
     run("reset", { prompt: "看看情况" });
     for (let i = 1; i <= 6; i++) run("post", { tool_name: "Read", tool_input: { file_path: `g${i}.txt`, limit: 5 }, tool_response: { content: `w${i}` } });
     assert.ok(run("stop", { response: "就这样了" }).out.includes("证据锚点")); // ZCode 载荷照常打回
+  });
+});
+
+describe("工程自检（v2.5.1：防版本与文档漂移）", () => {
+  const ROOT = (p) => fileURLToPath(new URL(p, import.meta.url));
+
+  test("版本一致性：五处清单 + ENGINE_VERSION + 引擎头注释完全相同", () => {
+    const guard = readFileSync(GUARD, "utf8");
+    const engine = (guard.match(/ENGINE_VERSION = "([^"]+)"/) || [])[1];
+    const header = (guard.match(/focus-guard 护栏脚本 v(\d+\.\d+\.\d+)/) || [])[1];
+    assert.ok(engine, "未找到 ENGINE_VERSION");
+    assert.equal(header, engine, "引擎头注释版本与 ENGINE_VERSION 漂移");
+    const manifests = [
+      "../package.json",
+      "../marketplace.json",
+      "../.zcode-plugin/plugin.json",
+      "../.claude-plugin/plugin.json",
+      "../.claude-plugin/marketplace.json",
+    ];
+    for (const rel of manifests) {
+      const j = JSON.parse(readFileSync(ROOT(rel), "utf8"));
+      const v = j.version || (j.plugins && j.plugins[0] && j.plugins[0].version);
+      assert.equal(v, engine, `${rel} 版本与引擎 ${engine} 不一致`);
+    }
+  });
+
+  test("文档-实现口径对齐：术语 / 43条处置 / 58条阶段 / 未机械化清单", () => {
+    const rules = readFileSync(ROOT("../docs/RULES.md"), "utf8");
+    const skill = readFileSync(ROOT("../skills/focus-thinking/SKILL.md"), "utf8");
+    const guard = readFileSync(GUARD, "utf8");
+    // 术语统一：映射表不再要求【请示报告】，引擎只认【授权识别】
+    assert.ok(!rules.includes("须输出【请示报告】"), "法条映射表仍残留旧术语【请示报告】");
+    assert.ok(rules.includes("【授权识别】") && guard.includes("PARDON_DECL_RE = /【授权识别】/"));
+    // 43条：法条处置与引擎一致（记档后清理，而非"停止执行并报告"）
+    assert.ok(rules.includes("残留则记录在案并清理"));
+    assert.ok(guard.includes('"residue-check"'));
+    // 58条：映射表落在 PostToolUse，Stop 表不再重复
+    const post = rules.slice(rules.indexOf("### PostToolUse 阶段"), rules.indexOf("### Stop 阶段"));
+    const stop = rules.slice(rules.indexOf("### Stop 阶段"), rules.indexOf("### Reset 阶段"));
+    assert.ok(post.includes("第五十八条"), "58条映射应位于 PostToolUse 阶段");
+    assert.ok(!stop.includes("第五十八条"), "Stop 阶段不应再列 58条");
+    // 追加额度口径三处统一（引擎/技能/README 同为三池各+10）
+    assert.ok(skill.includes("执行/侦查/委托三池各+10"));
+    // 推送语义统一：法条不再是"由领导执行"，而是"y 放行本次"
+    assert.ok(!rules.includes("推送远端属对外发布行为，由领导执行"), "第七十五条仍保留 2.2.0 旧推送口径");
+    assert.ok(rules.includes("经领导回复 y 放行后方可执行"));
+    // 空头条款透明化：未机械化清单必须存在
+    assert.ok(rules.includes("未机械化条款清单"));
   });
 });
