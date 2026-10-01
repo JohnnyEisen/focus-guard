@@ -200,3 +200,19 @@ description: 防思考失控的聚焦方法。在分析、调研、排查 bug、
 ### 11.5 委派 KPI（考核第28条细化）
 - 该委派时委派 +5；子代理摘要格式完整且 ≤200 字 +3。
 - 该委派却自己扛（主会话膨胀）-5；摘要超长/无格式污染主会话 -3。
+
+## 12. 高危命令审批（v2.4.0：自由与高危的分界线）
+
+### 12.1 为什么完全访问也要批
+权限模式管平台，护栏管后果。删除、强推、清盘、发布这类动作不可逆——它在放松环境里是唯一必须停下来等人的地方。闸拦的不是 AI 的自由，是"没有人看过的破坏"。
+
+### 12.2 高危清单（即使 yolo/完全访问也须审批）
+递归删除（rm -r、del /s、rd /s、Remove-Item -Recurse、rmdir /s）、强推（git push --force）、git clean -f、清盘格式化（mkfs、format x:、diskpart、dd of=/dev/*）、递归改权（chmod -R、icacls /grant）、删库（drop database/table、truncate table）、注册表删除（reg delete）、关机（shutdown）、发包（npm/pnpm/yarn publish）、容器清理（docker system prune、volume rm）。
+
+### 12.3 流程（可查证）
+1. 命中 → 引擎拒绝，输出【高危命令申请】：**命令原文 + 目标与影响范围 + 理由**。
+2. 人类批示（同意/批准，短指令）→ **原样重发同一命令**才放行——逐字一致校验，人类批的就是会跑的那条。
+3. 改动命令（哪怕一个字符）→ 重新申请。全程记 AUDIT.log（high-risk-request / high-risk-granted / high-risk-approved）。
+
+### 12.4 不设卡的日常
+普通单文件 rm、常规构建与测试命令不走审批——闸只拦不可逆与大规模破坏。放松的日常 + 刚性的高危，是这套护栏的效率来源。
