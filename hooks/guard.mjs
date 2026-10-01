@@ -51,6 +51,7 @@ const TTL_WEEK = 24 * 3600e3; // 自适应：7-30天未变 24h
 const TTL_STABLE = 7 * 86400e3; // 自适应：30天未变 7天
 
 const FUSE_PHRASE = "【熔断】无法通过现有资料定位核心问题";
+const FUSE_HINT = "1【最小复现】步骤/实验 2【联网证据】链接+原文 3【卡点记录】写HANDOFF.md"; // 各一行
 const MERCY_RE = /允许基于有限信息(进行)?猜测|(开启|启动|进入|批准|授予)绝境模式|【特赦】|(^|[\s，。！？,!?])特赦(?=$|[\s，。！？,!?])/;
 const CREDIT_RE = /继续|放行|延长/; // 信用延期批复（短指令）
 const STOP_ORDER_RE = /熔断|停止|^停$/; // 停止批复（短指令）
@@ -73,22 +74,18 @@ const BACKUP_KEEP = 100; // 2.2.0：.ai/backup/ 最大保留份数（超出淘�
 const DELEGATE_DEFAULT = 20; // 2.3.0：委托池默认额度（独立于执行池，批示『追加委托额度』+10）
 
 const DOWNGRADE_MSG =
-  "[触发⑤·熔断]改动类工具调用已拒绝（只读调查类仍放行）。按优先级给降级方案：" +
-  "1.【最小复现】1-3 个最小复现步骤，或按可能性排序的 2-3 个排查实验，交人类执行；" +
-  "2.【联网证据】WebSearch/WebFetch 查报错原文/官方文档，只输出原文链接和关键信息，不给修改建议；" +
-  "3.【卡点记录】卡点/已查文件/报错详情/已试方案写入 HANDOFF.md，等待一把手批示。" +
-  "未经批示严禁盲猜硬凑改代码。禁止静默，禁止直接结束对话。" +
-  "解除后按 [环境:OS] [任务:类型] 以后遇到X必须先做Y 的格式，把本次经验追加到 .ai/PATTERNS.md（下次卡点先 Grep 检索复用）。";
+  "[触发⑤·熔断]改动类已拒（只读放行）。三选一各一行：" + FUSE_HINT +
+  "。禁静默禁硬凑。解除后经验按 [环境:x][任务:y] 记入 .ai/PATTERNS.md。";
 
 const SESSION_RULES =
-  "<focus-guard AI履职执法模型v3.0 强制生效：日常零打扰，只看行为> " +
-  "【触发五条】①未取证就改文件/变更Bash ②≥5次收尾无锚点([文件:行号]/日志)且无【假设】 ③整读>50KB/Grep无head_limit/裸cat ④超预算 ⑤查无实据硬凑。" +
-  "【预算】批示关键词定额度(50/15/10)，可【任务规模】上调；侦查/执行分池，侦查池15次；执行池满+10，上限200；同mtime重复整读被拒。" +
-  "【进度】3次无效→熔断；停滞2次→【信用延期】请批示(继续/放行/延长→+10)。" +
-  "【处罚】L1打回→L2取证→L3熔断(只读放行)→L4记档→L5降权→L6上报；人类指令=批示解除。" +
-  "【熔断出口】输出『" + FUSE_PHRASE + "』+降级方案(1最小复现 2联网证据 3HANDOFF.md)。" +
-  "【特赦】仅认人类短指令明示授权(启动绝境模式/允许基于有限信息猜测/【特赦】)；声称受权须先出【授权识别】(引批示原文+法条)，否则越权。" +
-  "【留痕】全程记<工作区>/.focus-guard/AUDIT.log。条文见focus-thinking技能与docs/RULES.md。";
+  "<focus-guard AI履职执法模型v3.0：日常零打扰，只看行为>" +
+  "【触发】①未取证就改 ②≥5次收尾无[文件:行号]锚点且无【假设】 ③整读>50KB/Grep无head_limit/裸cat ④超预算 ⑤查无实据硬凑。" +
+  "【额度】批示关键词定(50/15/10)，【任务规模】可上调；侦查/执行/委托三池分立，执行满+10上限200。" +
+  "【进度】3次无效→熔断；停滞2次→【信用延期】(继续/放行/延长→+10)。" +
+  "【处罚】L1打回→L2取证→L3熔断(只读放行)→L4记档→L5降权→L6上报；人类指令=批示。" +
+  "【熔断出口】『" + FUSE_PHRASE + "』+三行降级方案。" +
+  "【特赦】仅认短指令(绝境模式/允许猜测/【特赦】)；受权须先出【授权识别】(引原文+法条)，否则越权。" +
+  "【留痕】全程记<工作区>/.focus-guard/AUDIT.log。细则见focus-thinking技能与docs/RULES.md。";
 
 function readStdinJson() {
   try {
@@ -218,6 +215,7 @@ function loadState(path) {
       caseCache: {},
       taskInitial: BUDGET_DEFAULT,
       pollutionFlagged: false,
+      pushAuthorized: false,
       delegateBudget: DELEGATE_DEFAULT, // 2.3.0：委托池 granted 上限（只升不降）
       delegateUsed: 0, // 2.3.0：委托池累计消耗
       delegated: false, // 2.3.0：本任务是否已委派过
@@ -539,11 +537,11 @@ function penalize(state, sid, trigger, evidence) {
 }
 
 function ladderNote(level) {
-  if (level >= 6) return "已升级 L6 并上报人类，等待批示。";
-  if (level >= 5) return "已升级 L5 降权：只读模式，改动类操作全部拒绝，直至批示。";
-  if (level >= 4) return "已升级 L4：本次违规记档 AUDIT.log。";
-  if (level >= 3) return "已升级 L3 熔断：等待批示或给出降级方案。";
-  if (level >= 2) return "已升级 L2 强制取证：下一次调用必须是取证类（Read/Grep/搜索/只读命令）。";
+  if (level >= 6) return "L6：已上报人类。";
+  if (level >= 5) return "L5：只读模式直至批示。";
+  if (level >= 4) return "L4：已记档。";
+  if (level >= 3) return "L3：等批示或降级方案。";
+  if (level >= 2) return "L2：下一调用必须取证。";
   return "";
 }
 
@@ -568,7 +566,7 @@ if (mode === "start") {
     // 36条 异地交叉巡视：新会话接手 → 复核前任结论
     try {
       readFileSync(join(projDir, "HANDOFF.md"), "utf8");
-      ctx += "\n【异地交叉巡视·36条】检测到 HANDOFF.md：本会话接手前任任务，先读 HANDOFF.md 复核前任结论；未证实内容一律标【假设】。";
+      ctx += "\n【异地交叉巡视·36条】发现 HANDOFF.md：先读复核前任结论，未证实标【假设】。";
       audit(sid, "handover-inspect", { level: null, evidence: "36条 交叉巡视：发现 HANDOFF.md" });
     } catch {}
     // 42条 部署版本核验：运行引擎 vs 工作区源码
@@ -611,7 +609,7 @@ if (mode === "start") {
       if (regVer && regVer !== ENGINE_VERSION) drift.push(`注册表v${regVer}`);
       if (srcVer && srcVer !== ENGINE_VERSION) drift.push(`市场源v${srcVer}`);
       if (drift.length) {
-        ctx += `\n【部署版本核验·立法法第七章】运行引擎 v${ENGINE_VERSION} ≠ ${drift.join(" / ")}，规则体系存在部署漂移，请领导核验一致性。`;
+          ctx += `\n【部署版本核验】引擎v${ENGINE_VERSION} ≠ ${drift.join(" / ")}，存在部署漂移，请核验。`;
         audit(sid, "deploy-mismatch", { level: null, evidence: `立法法第七章 引擎v${ENGINE_VERSION} vs ${drift.join(" / ")}` });
       }
     }
@@ -640,6 +638,9 @@ if (mode === "reset") {
   const grant = promptText.match(MERCY_RE);
   const mercy = !!(grant && promptText.trim().length <= MERCY_SHORT);
   if (mercy) audit(sid, "mercy-granted", { level: null, evidence: `批示原文: ${grant[0]}`, pardon: true });
+  // 2.3.0：人类本回合指令明示『上传/推送/push』且无否定前缀 → 推送批示（推送闸本回合放行）
+  const pushAuth = /上传|推送|push/i.test(promptText) && !/(不|禁|勿|别|暂|缓)[^，。；\n]{0,6}(上传|推送|push)/i.test(promptText);
+  if (pushAuth) audit(sid, "push-authorized", { level: null, evidence: "批示含推送语义，本回合推送闸放行", pardon: true });
 
   // 总纲三：仅当明确探测到 shell 变化时重检环境
   if (state.envCache && state.envCache.shellIdKey && state.envCache.shellIdKey !== quickShellId()) {
@@ -696,6 +697,7 @@ if (mode === "reset") {
     fused: false,
     stopBlocked: false,
     mercy,
+    pushAuthorized: pushAuth, // 2.3.0：推送批示按回合生效
     violations: 0,
     forcedInvestigate: false,
     probation: false,
@@ -750,16 +752,14 @@ if (mode === "pre") {
     } catch {}
   }
 
-  // 2.2.0 二.3/五.3：推送到远程属不可逆操作——本地 commit 测试全绿后 AI 可做，推送由人类在 UI 执行。
-  // 当回合人类短指令明示特赦（state.mercy）才放行。
-  if (tool === "Bash" && !state.mercy) {
+  // 2.2.0 二.3/五.3：推送到远程属不可逆操作——本地 commit 测试全绿后 AI 可做，推送由人类执行。
+  // 放行通道：当回合人类短指令明示特赦（state.mercy），或人类本回合指令明示『上传/推送/push』（state.pushAuthorized）。
+  if (tool === "Bash" && !state.mercy && !state.pushAuthorized) {
     const cmd = String(ti.command || "");
     if (PUSH_RE.test(cmd) && !/--dry-run\b/.test(cmd)) {
       audit(sid, "deny-push", { level: null, evidence: `二.3 推送闸 ${cmd.slice(0, 100)}` });
       process.stderr.write(
-        "[不可逆·推送闸]推送到远程由人类在 UI 执行，AI 只准备不推送：" +
-          "本地 commit（测试全绿后可自行执行）就绪后，输出一行【提交申请】修改:<文件> (+n,-m) | 测试:n/n 绿 | 允许提交？(y/n)，" +
-          "等人类批示或自行点推送。确需代推：先获人类明示批示（短指令特赦）再重试。"
+        "[不可逆·推送闸]推送由人类执行。本地 commit 后输出一行【提交申请】等批示；人类本回合明示『上传/推送』即构成推送批示。"
       );
       process.exit(2);
     }
@@ -772,8 +772,7 @@ if (mode === "pre") {
       const lvl = penalize(state, sid, "violation-subagent-usurp", `56条 熔断期启动子代理 ${String(ti.description || ti.prompt || "").slice(0, 60)}`);
       saveState(path, state);
       process.stderr.write(
-        `[越权绕行·L${lvl}]熔断期间启动子代理执行被禁操作，按对抗审查论处：L4 记档 + L5 降权。` +
-          `熔断期只读调查可亲自执行（白名单放行），或输出『${FUSE_PHRASE}』走降级方案，或等人类批示解除。${ladderNote(lvl)}`
+        `[越权绕行·L${lvl}]熔断期启动子代理执行被禁操作：L4 记档+L5 降权。只读可亲自查，或等批示。${ladderNote(lvl)}`
       );
       process.exit(2);
     }
@@ -786,8 +785,7 @@ if (mode === "pre") {
     if ((state.delegateBudget ?? DELEGATE_DEFAULT) <= 0) {
       audit(sid, "delegate-exhausted", { level: null, evidence: `2.3.0 委托池用尽 剩余=0 累计=${state.delegateUsed || 0}` });
       process.stderr.write(
-        "[委托池用尽]本任务子代理额度已用完（默认 20 次，独立于主会话执行池，不互相挤占）。" +
-          "继续委派请人类批示『追加委托额度』（+10）；或在主会话执行池内自行完成并尽快收敛。"
+        "[委托池用尽]子代理额度已用完（默认20次，独立于执行池）。请批示『追加委托额度』(+10)，或主会话自行收敛。"
       );
       process.exit(2);
     }
@@ -812,8 +810,8 @@ if (mode === "pre") {
     audit(sid, state.probation ? "deny-L5-probation" : "deny-L2-forced", { level: lvl, evidence: `${tool} ${filePath}` });
     process.stderr.write(
       state.probation
-        ? "[L5 降权]会话处于只读模式（屡犯后降权）：改动类操作全部拒绝，仅可调查取证。需要改动请等待人类批示。"
-        : "[L2 强制取证]下一次调用必须是取证类（Read/Grep/搜索/只读命令），取证后自动解除。"
+        ? "[L5 降权]只读模式，改动类全拒，等人类批示。"
+        : "[L2 强制取证]下一调用必须是取证类，取证后自动解除。"
     );
     process.exit(2);
   }
@@ -826,9 +824,7 @@ if (mode === "pre") {
     saveState(path, state);
     audit(sid, "pollution-gate", { level: null, evidence: `三.1 污染核实 ${tool} ${filePath}` });
     process.stderr.write(
-      "[污染核实闸]上一轮工具输出曾与指令参数矛盾（已记档，标记可疑）。改动前先输出：" +
-        "【污染核实】上次输出与参数矛盾（预期X，实际Y），我已核对，结论是：<可信/不可信/需重试>。" +
-        "只读核验（Read/Grep）不受限，可先交叉验证再重试本次修改。"
+      "[污染核实闸]上轮输出曾与参数矛盾（已记档）。先输出：【污染核实】预期X 实际Y，结论：可信/不可信/需重试，再重试本次修改。只读核验不受限。"
     );
     process.exit(2);
   }
@@ -838,7 +834,7 @@ if (mode === "pre") {
     const level = penalize(state, sid, "violation-no-investigation", `${tool} ${filePath}`);
     saveState(path, state);
     process.stderr.write(
-      `[触发①·L${level}]程序正义：先调查、后取证、再结论。本回合尚未做任何调查（读文件/Grep/搜索/只读命令），不得改动代码或文件。先取证再动手。${ladderNote(level)}`
+      `[触发①·L${level}]程序正义：本回合零调查即改文件/执行变更命令，拒绝。先 Read/Grep/只读命令取证再动手。${ladderNote(level)}`
     );
     process.exit(2);
   }
@@ -860,7 +856,7 @@ if (mode === "pre") {
         const level = penalize(state, sid, "violation-blind-write", `盲写未读文件 ${filePath}`);
         saveState(path, state);
         process.stderr.write(
-          `[触发②·L${level}]盲写拦截：目标文件已存在但本回合从未读取过，盲写有覆盖未知内容的风险。先 Read 目标文件取证，再修改。${ladderNote(level)}`
+          `[触发②·L${level}]盲写拦截：目标文件已存在但本回合未读过，先 Read 取证再改。${ladderNote(level)}`
         );
         process.exit(2);
       }
@@ -875,7 +871,7 @@ if (mode === "pre") {
         const level = penalize(state, sid, "violation-read-gate", `${filePath} ${kb}KB 整读`);
         saveState(path, state);
         process.stderr.write(
-          `[触发③·L${level}]体积刺客：${filePath} 有 ${kb}KB，整读一次性灌入大量上下文并在后续每步重复计费。改用 limit+offset 分段、Grep 定位再精读、或交子代理摘要。${ladderNote(level)}`
+          `[触发③·L${level}]体积刺客：${filePath} ${kb}KB，整读一次灌入、步步重复计费。limit+offset 分段或交子代理。${ladderNote(level)}`
         );
         process.exit(2);
       }
@@ -886,7 +882,7 @@ if (mode === "pre") {
     const level = penalize(state, sid, "violation-grep-gate", "Grep content 无 head_limit");
     saveState(path, state);
     process.stderr.write(
-      `[触发③·L${level}]体积刺客：Grep content 模式必须带 head_limit(≤50)，否则全部匹配灌进上下文。加 head_limit 重试，或先用 files_with_matches/count 定位。${ladderNote(level)}`
+      `[触发③·L${level}]体积刺客：Grep content 必带 head_limit≤50，或先用 files_with_matches 定位。${ladderNote(level)}`
     );
     process.exit(2);
   }
@@ -897,7 +893,7 @@ if (mode === "pre") {
       const level = penalize(state, sid, "violation-bash-gate", `裸 cat/type：${cmd.slice(0, 60)}`);
       saveState(path, state);
       process.stderr.write(
-        `[触发③·L${level}]体积刺客：禁裸 cat/type 整读刷屏。改用 Read limit 分段、cat x | head -100，或先 grep/wc 定位体积与行号再精读。${ladderNote(level)}`
+        `[触发③·L${level}]体积刺客：禁裸 cat/type 刷屏。cat x | head -100 或先 grep/wc 定位。${ladderNote(level)}`
       );
       process.exit(2);
     }
@@ -924,7 +920,7 @@ if (mode === "pre") {
           if (Date.now() - (rec.readAt || 0) < ttl.ms) {
             audit(sid, "casefile-hit", { level: null, evidence: `2.0卷宗 免重读 ${filePath} ttl=${ttl.src}` });
             process.stderr.write(
-              `[卷宗·免重读放行]${filePath} 指纹一致（${rec.via || "mtime+size"}）且 TTL 未超（${ttl.src}）——已有取证仍有效，禁止重复整读。直接复用已有结论与记录；确需内容用 offset 增量读，或请人类批示。文件如已变更请说明——下次读取将自动更新卷宗指纹。`
+              `[卷宗·免重读]${filePath} 指纹一致（${rec.via || "mtime+size"}）且 TTL 未超（${ttl.src}），勿重复整读；需新内容用 offset 增量读或请批示。`
             );
             process.exit(2);
           }
@@ -1022,16 +1018,16 @@ if (mode === "post" || mode === "postfail") {
       state.fused = true;
       state.violations = Math.max(state.violations || 0, 3);
       audit(sid, "stall-fuse", { level: 3, evidence: `硬上限：有效调用达 ${BUDGET_CAP}` });
-      reason = `[触发④·L3]硬上限：本会话有效调用已达 ${BUDGET_CAP} 次，强制熔断防失控。输出『${FUSE_PHRASE}』并给降级方案(1最小复现 2联网证据 3HANDOFF.md)，等待批示。`;
+      reason = `[触发④·L3]硬上限 ${BUDGET_CAP} 次，强制熔断。输出『${FUSE_PHRASE}』+三行降级方案，等批示。`;
     } else if ((state.effectiveCalls || 0) >= (state.taskBudget || BUDGET_DEFAULT)) {
       state.taskBudget = Math.min((state.taskBudget || BUDGET_DEFAULT) + REFILL, BUDGET_CAP);
       audit(sid, "budget-extend", { level: null, evidence: `自动续杯 budget=${state.taskBudget} eff=${state.effectiveCalls} stall=0` });
-      reason = `[触发④]动态预算续杯：执行池有效调用 ${state.effectiveCalls} 次已达阈值，预算自动 +${REFILL} → ${state.taskBudget}（硬上限 ${BUDGET_CAP}）。任务继续，但请自查：核心问题是否已在收敛？`;
+      reason = `[触发④]续杯：执行池 ${state.effectiveCalls} 次达阈值，预算+${REFILL}→${state.taskBudget}。任务继续，自查是否收敛。`;
     }
     if (inv && !state.invWarned && (state.invCalls || 0) > (state.invCap || INV_POOL_DEFAULT)) {
       state.invWarned = true;
       audit(sid, "inv-pool-exceeded", { level: null, evidence: `20条 侦查池超限 inv=${state.invCalls}/${state.invCap || INV_POOL_DEFAULT}` });
-      reason = `[20条·双预算池]侦查池（独立 ${state.invCap || INV_POOL_DEFAULT} 次）已超限。侦查与执行不互相挤占，但能耗双控要求收敛：汇总已有证据向人类请示追加（短指令『追加额度』→ 双池+10），或交子代理摘要压缩侦查成本。`;
+      reason = `[20条]侦查池（${state.invCap || INV_POOL_DEFAULT}次）超限。汇总证据请示追加（『追加额度』+10），或交子代理压缩侦查成本。`;
     }
   } else {
     state.stalledStreak = (state.stalledStreak || 0) + 1;
@@ -1040,12 +1036,10 @@ if (mode === "post" || mode === "postfail") {
       state.fused = true;
       state.violations = Math.max(state.violations || 0, 3);
       audit(sid, "stall-fuse", { level: 3, evidence: `连续 ${state.stalledStreak} 次无效调用 eff=${state.effectiveCalls || 0}` });
-      reason = `[触发④·L3]真失控：连续 ${state.stalledStreak} 次无效调用（重复读同一内容/同命令同返回/无新增证据）。立即停止探索：` +
-        `输出『${FUSE_PHRASE}』并给降级方案(1最小复现 2联网证据 3HANDOFF.md)，或等人类批示。`;
+      reason = `[触发④·L3]真失控：连续 ${state.stalledStreak} 次无效调用。停止探索，输出『${FUSE_PHRASE}』+三行降级方案，或等批示。`;
     } else if ((state.stalledStreak || 0) === STALL_FUSE - 1) {
       audit(sid, "stall-warning", { level: null, evidence: `停滞 ${state.stalledStreak} 次 eff=${state.effectiveCalls || 0}` });
-      reason = `[触发④]停滞预警：已连续 ${state.stalledStreak} 次无效调用，再有一次即 L3 熔断。` +
-        `换一种有证据依据的方法，或结束回合输出【信用延期】请人类批示（回复 继续/放行/延长 → 预算+10；回复 熔断/停 → 立即熔断）。`;
+      reason = `[触发④]停滞预警：连续 ${state.stalledStreak} 次无效，再有一次即熔断。换有证据的方法，或结束回合发【信用延期】请批示。`;
     }
   }
 
@@ -1061,7 +1055,7 @@ if (mode === "post" || mode === "postfail") {
       if (n > 0 && outLines.length > n) {
         state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
         audit(sid, "ctx-pollution", { level: null, evidence: `58条 行数超限 head ${n} → 实际 ${outLines.length} 行 | ${cmd.slice(0, 60)}` });
-        reason = `[38条·上下文污染]工具输出与指令矛盾：命令承诺 head ${n} 行，实际返回 ${outLines.length} 行。立即停止使用本次输出，不基于不可信输出继续工作；用带标记的小命令（echo MARK-X）隔离核实，并向人类报告此异常。`;
+        reason = `[38条·上下文污染]输出与指令矛盾：head ${n} 行实得 ${outLines.length}。停用本次输出，echo MARK-X 隔离核实并报告人类。`;
       }
     }
     if (!reason && /\b(find|git\s+(ls-files|ls-tree))\b/.test(cmd)) {
@@ -1074,7 +1068,7 @@ if (mode === "post" || mode === "postfail") {
       if (dup) {
         state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
         audit(sid, "ctx-pollution", { level: null, evidence: `58条 路径重复 ${dup.slice(0, 80)} | ${cmd.slice(0, 50)}` });
-        reason = `[38条·上下文污染]清单类输出出现不可能的重复路径（${dup.slice(0, 60)}）。立即停止使用本次输出，不基于不可信输出继续工作；用带标记的小命令（echo MARK-X）隔离核实，并向人类报告此异常。`;
+        reason = `[38条·上下文污染]清单出现不可能的重复路径（${dup.slice(0, 60)}）。停用本次输出，echo MARK-X 隔离核实并报告人类。`;
       }
     }
   }
@@ -1087,8 +1081,7 @@ if (mode === "post" || mode === "postfail") {
       state.dumpCount = (state.dumpCount || 0) + 1;
       audit(sid, "scold-dump", { level: null, evidence: `${tool} 输出 ${Math.round(probe.total / 1024)}KB` });
       reason =
-        `体积刺客：本次 ${tool} 输出约 ${Math.round(probe.total / 1024)}KB，已进上下文无法撤回。` +
-        `下一次必须管道过滤(head/tail/wc/grep)后再执行。本会话已累计 ${state.dumpCount} 次。`;
+        `体积刺客：${tool} 输出 ${Math.round(probe.total / 1024)}KB 已入上下文。下次先 head/tail/wc/grep 过滤（累计 ${state.dumpCount} 次）。`;
     }
   }
 
@@ -1107,8 +1100,7 @@ if (mode === "post" || mode === "postfail") {
       state.kpi = (state.kpi || 0) - 3;
       audit(sid, "delegate-summary-pollution", { level: null, evidence: `2.3.0 摘要污染 -3 len=${sumText.length} fmt=${fmtOk ? "有" : "无"}` });
       reason =
-        "[委派摘要拒收·KPI-3]子代理回传未按摘要格式或超过 200 字，拒绝全量采纳——不要把子代理输出原样搬进主会话。" +
-        "压缩为：【子代理摘要】任务：<一句话>｜结果：<≤5条关键信息>｜异常：<无/具体报错>｜文件线索：<文件:行号>，以此为准继续工作。";
+        "[委派摘要拒收·KPI-3]超200字或缺字段，拒绝全量采纳。压缩为：【子代理摘要】任务：…｜结果：≤5条｜异常：…｜文件线索：文件:行号，以此继续。";
     } else {
       state.kpi = (state.kpi || 0) + 3;
       audit(sid, "kpi-summary-good", { level: null, evidence: `2.3.0 委派摘要合格 +3 len=${sumText.length}` });
@@ -1149,9 +1141,8 @@ if (mode === "post" || mode === "postfail") {
           state.kpi = (state.kpi || 0) - 5;
           audit(sid, "kpi-not-delegated", { level: null, evidence: `2.3.0 强制场景未委派 -5 ${scenario}` });
           reason =
-            `[未尽职·KPI-5]${scenario}属强制委派场景（全库搜索≥3目录或≥10文件 / 大文档>50KB或>2000行 / 批量≥5文件 / 独立并行任务），本任务尚未委派子代理，主会话上下文因此膨胀。` +
-            `改用 Agent 委派执行：委派池独立核算（默认 20 次，不占执行池），主会话只收【子代理摘要】。` +
-            `合法委派不计违规；确属特例无需委派的，向人类说明并留痕。`;
+            `[未尽职·KPI-5]${scenario}属强制委派场景（≥3目录/≥10文件、>50KB或>2000行、≥5文件批量、并行任务），本任务未委派过。` +
+            `改用 Agent 委派，只回【子代理摘要】；特例需向人类说明。`;
         }
       }
     }
@@ -1163,7 +1154,7 @@ if (mode === "post" || mode === "postfail") {
     if (state.writeOps % RANDOM_AUDIT_EVERY === 0) {
       audit(sid, "random-audit", { level: null, evidence: `第 ${state.writeOps} 次写操作全量审计 ${normalize(ti.file_path)}` });
       reason =
-        `抽查A：本次写操作（第 ${state.writeOps} 次）已全量审计并留痕 AUDIT.log。确认该修改有证据锚点([文件:行号]/[日志原文])；无锚点请补【假设】标注或说明依据。`;
+        `抽查A：第 ${state.writeOps} 次写操作已留痕。确认有锚点([文件:行号])，无则补【假设】。`;
     }
   }
 
@@ -1237,9 +1228,7 @@ if (mode === "stop") {
         audit(sid, "violation-usurp-pardon", { level: 3, evidence: invalid });
         saveState(path, state);
         block(
-          `[越权解释授权·L3熔断]${invalid}。` +
-            `正确姿势：输出【授权识别】并引用本回合人类指令的真实原文+依据法条；` +
-            `或灰色地带输出【授权待确认】暂停求证，人类回复【特赦】后放行。禁止自行推断授权。`
+          `[越权解释授权·L3]${invalid}。正确：【授权识别】引本回合人类指令原文+法条；未明→【授权待确认】。禁止自行推断。`
         );
         process.exit(0);
       }
@@ -1285,8 +1274,7 @@ if (mode === "stop") {
     saveState(path, state);
     audit(sid, "reject-no-account", { level: 3, evidence: "双规后未交代" });
     block(
-      `[触发⑤]双规已触发但未交代。立即输出『${FUSE_PHRASE}』并按优先级给降级方案：` +
-        `1最小复现 2联网证据原文 3写HANDOFF.md。禁止静默结束。`
+      `[触发⑤]熔断已触发未交代。输出『${FUSE_PHRASE}』+三行降级方案，禁静默结束。`
     );
     process.exit(0);
   }
@@ -1305,9 +1293,8 @@ if (mode === "stop") {
     state.turnCount = 0;
     saveState(path, state);
     block(
-      `[触发②·L${level}]下结论必须有证据锚点([文件:行号]/[日志原文]/工具结果)，或显式标注【假设】。` +
-        `本回合 ${tc} 次调用后无锚点收尾。补交：写 HANDOFF.md，或在回复中给出 结论/证据链/遗留问题/下一步。` +
-        `或依《授权识别与留痕条例》：确有明示授权→输出【授权识别】声明（引用本回合人类指令原文+依据法条）；意图明显但未明说→输出【授权待确认】暂停求证，人类回复【特赦】后放行。${ladderNote(level)}`
+      `[触发②·L${level}]本回合 ${tc} 次调用后无证据锚点收尾。补：结论+[文件:行号]证据链，或写 HANDOFF.md，或标【假设】；` +
+        `确有授权→【授权识别】引原文+法条，未明→【授权待确认】。${ladderNote(level)}`
     );
     process.exit(0);
   }
