@@ -1220,7 +1220,7 @@ describe("工程自检（防版本与文档漂移）", () => {
     assert.equal(new Set(descs).size, descs.length, "五处清单 description 必须互不相同（检测到镜像复制）");
   });
 
-  test("文档-实现口径对齐：术语 / 43条处置 / 58条阶段 / 未机械化清单", () => {
+  test("文档-实现口径对齐：术语 / 43条处置 / 58条阶段 / 未机械化清单 / 安装判据", () => {
     const rules = readFileSync(ROOT("../docs/RULES.md"), "utf8");
     const skill = readFileSync(ROOT("../skills/focus-thinking/SKILL.md"), "utf8");
     const guard = readFileSync(GUARD, "utf8");
@@ -1240,8 +1240,21 @@ describe("工程自检（防版本与文档漂移）", () => {
     // 推送语义统一：法条不再是"由领导执行"，而是"y 放行本次"
     assert.ok(!rules.includes("推送远端属对外发布行为，由领导执行"), "第七十五条仍保留 2.2.0 旧推送口径");
     assert.ok(rules.includes("经领导回复 y 放行后方可执行"));
-    // 空头条款透明化：未机械化清单必须存在
+    // 空头条款透明化：未机械化清单必须存在，且已列入"日志/缓存无清理"这条实情
     assert.ok(rules.includes("未机械化条款清单"));
+    assert.ok(rules.includes("第六十一条"), "未机械化清单须包含第六十一条（会话状态无自动清理）");
+    // 注入体量不得残留旧实测值（411 字；393 字是拼接 FUSE_PHRASE 前的错误统计）
+    assert.ok(!rules.includes("393 字"), "RULES 常驻注入实测值未同步（应为 411 字）");
+    // 跨文档判据：INSTALL 的"验证生效"字符串必须逐字取自引擎真实注入，
+    // 否则用户照文档验证会得出"没装上"的错误结论（此前文案是"…v3.0 强制生效：…"，引擎里没有这段）
+    const runs = makeRunner("doc-criterion");
+    const dir = freshDir();
+    const out = runs("start", { session_id: "doc-criterion" }, { ZCODE_PROJECT_DIR: dir }).out;
+    const injected = JSON.parse(out).hookSpecificOutput.additionalContext.split("\n【")[0];
+    const install = readFileSync(ROOT("../INSTALL.md"), "utf8");
+    assert.ok(install.includes(injected.slice(0, 40)), "INSTALL 的验证判据必须逐字取自真实注入");
+    assert.ok(!install.includes("强制生效"), "INSTALL 不得残留不存在的注入文案");
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test("hooks.json 六条钩子与引擎实现一一对应（防注册名漂移）", () => {

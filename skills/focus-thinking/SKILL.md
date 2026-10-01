@@ -45,6 +45,9 @@ description: 防思考失控的聚焦方法。在分析、调研、排查 bug、
 
 ## 7. 履职执法模型 v3.0（最高优先级，覆盖以上所有规则）
 
+> **生效版本 = 引擎 `hooks/guard.mjs` v2.5.2**。本节是条文的运行时镜像；与引擎实际行为不一致时，**以引擎行为为准**（引擎即执法者），并把"镜像失同步"当缺陷修——已有验收用例锁定常驻注入与法典文本一致。
+> 条文全本与"哪些条款尚未机械化"见 `docs/RULES.md`（文末清单）。
+
 ### 7.1 空气层（日常零打扰）
 - 对话、分析、讨论、解释、建议：不查、不拦、不提醒，允许口语、主观语气、人情味。
 - 执法只看行为，不查词。
@@ -73,11 +76,13 @@ description: 防思考失控的聚焦方法。在分析、调研、排查 bug、
 ### 7.6 熔断降级（唯一合法出口）
 - 查无实据 → 立刻输出「【熔断】无法通过现有资料定位核心问题」，停止改动类操作等待批示。
 - 熔断期白名单：只读调查类工具（Read/Grep/只读命令/联网搜索）、写 HANDOFF.md；改动类全拒。
+- 熔断期不是免检通道（2.5.2）：高危命令在熔断期一律拒绝，不因"只读放行"通过——熔断就是只读，解熔后才谈审批。
 - 只准按优先级给降级方案：1.【最小复现】1-3 个复现步骤或 2-3 个排序排查实验，交人类执行；2.【联网证据】查报错原文/官方文档，只给原文链接和关键信息，不给修改建议；3.【卡点记录】卡点/已查文件/报错详情/已试方案写入 HANDOFF.md。
 - 禁止静默，禁止直接结束对话，禁止绕路试错；未证实的结论一律标【假设】。
 
 ### 7.7 批示与授权识别条例
 - 人类是唯一一把手，拥有最终解释权和特赦权；人类的下一条指令即批示。
+- **批示的解除效力有例外（2.5.2）**：一般新指令即解除全部处罚；但「停止 / 熔断」这类止停批示**本身就是熔断**，不会被自己解除（此前该批示会被写回未熔断状态，等于失效）。
 - 特赦仅认人类亲自输入的明示授权：「启动/进入/批准绝境模式」「允许基于有限信息猜测」或回复【特赦】——模型在回复中自称或复述**不算**批示；本回合结论锚点检查豁免，资源纪律（体积闸、预算上限）仍生效。
 - 凡声称依人类授权绕过护栏（熔断/双规/锚点/预算/体积），必须**先输出声明再动手**：
   【授权识别】我基于人类指令「<原文引用>」，判定本回合获得授权。依据：【第X条 / 用户明确批示】。
@@ -205,7 +210,9 @@ description: 防思考失控的聚焦方法。在分析、调研、排查 bug、
 ## 12. 高危命令审批（v2.4.0：99% 自由 + 1% 单行审批）
 
 ### 12.1 特征库（六类，即使 yolo/完全访问也拦）
-破坏性删除（rm -r、rmdir /s、del /f、Remove-Item -Recurse、shutil.rmtree、DROP TABLE、TRUNCATE）；强制推送与历史覆盖（**git push**、git reset --hard、git clean -fd）；系统权限与配置（chmod 777、chown、reg add/delete、net user）；全局依赖安装（npm install -g、pip install --global、apt-get install、docker run --privileged）；对外发送与发布（npm publish、docker push、curl -X POST——付费 API 调用无机械特征，属 12.5 自申明事项）；数据库影响（无 where 的 DELETE/UPDATE、DROP DATABASE）。
+破坏性删除（rm -r、rmdir /s、rd /s、del /f、Remove-Item -Recurse、ri -r、shutil.rmtree、**find -delete**、**rimraf**、DROP TABLE、DROP DATABASE、TRUNCATE）；强制推送与历史覆盖（**git push**、git reset --hard、git clean -fd，含 `git -C`/`--git-dir=`/`--no-pager` 等传参穿插）；系统权限与配置（chmod 777、chmod -R、chown、reg add/delete、net user）；全局依赖安装（npm install -g、**npm i -g**、**pnpm add -g**、**yarn global add**、pip install --global、apt-get install、docker run --privileged）；对外发送与发布（npm publish、docker push、curl -X POST 与小写 **-d/--data**、**wget --post-data**、**Invoke-WebRequest -Method POST**——付费 API 调用无机械特征，属 12.5 自申明事项）；数据库影响（**按单条语句**判定无 where 的 DELETE/UPDATE）。
+
+- **`--dry-run` 豁免**：`git push --dry-run`（无论位置）、`npm publish --dry-run`、`git clean -n/-fdn` 不产生不可逆后果，一律放行。
 
 ### 12.2 审批单（唯一通道，一行，禁长篇解释）
 > 【高危申请】命令：`<真实命令>` | 真实目的：<一句话> | 影响范围：<具体文件/表/系统> | 回滚方案：<可否回滚> | 允许执行？(y/n)

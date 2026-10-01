@@ -1,6 +1,6 @@
 # FocusGuard 安装指南（v2.5.2）
 
-前置要求：Node.js ≥ 18（引擎零依赖，仅用内置模块）。逐行验证：
+前置要求：Node.js ≥ 18.17（引擎零依赖，仅用内置模块；与 `package.json` 的 `engines` 一致）。逐行验证：
 
 ```bat
 node -v
@@ -33,13 +33,15 @@ dir /b marketplace.json
 5) 新开一个会话
 ```
 
-验证生效：新会话开头出现 `<focus-guard AI履职执法模型v3.0 强制生效：日常零打扰，只看行为>` 注入即为生效；工作区出现 `.ai/CASE_FILE.md` 与 `.focus-guard/AUDIT.log` 即为卷宗与留痕就绪。
+验证生效：新会话开头出现 `<focus-guard AI履职执法模型v3.0：日常零打扰，只看行为>【触发】…` 的注入即为生效（该字符串是引擎 `SESSION_RULES` 的开头，逐字镜像见 `docs/RULES.md` 第四部分；早期文档此处曾写过引擎里并不存在的措辞，以本判据为准）；工作区出现 `.ai/CASE_FILE.md` 与 `.focus-guard/AUDIT.log` 即为卷宗与留痕就绪。
 
-源码目录内跑验收（86 用例应全绿；仓库已带 CI，推送即自动跑）：
+源码目录内跑质量闸（86 用例应全绿；仓库已带 CI，推送即自动跑）：
 
 ```bat
 cd /d <仓库目录>
-node --test tests/acceptance.test.mjs
+npm test         :: 验收 86 用例（等价于 node --test tests/acceptance.test.mjs）
+npm run eval     :: 对抗评测：61 条高危写法 + 34 条良性命令，有漏检或误报即失败
+npm run check    :: test + eval
 ```
 
 ## 二、DSH 安装（逐行可复制，v2.5.0 起为硬拦截）
@@ -67,7 +69,7 @@ node --test tests/acceptance.test.mjs
 1. **硬拦截语义完整**：PreToolUse `deny`/`ask` 均支持；阻断原因 stderr 原文透传给模型（高危审批单、污染告警、委派提醒模型全部可见）；`deny > ask > allow` 合并。
 2. **卷宗落点自动正确**：桥为每个钩子进程设置 `CLAUDE_PROJECT_DIR` = 会话工作区，卷宗/AUDIT.log 直接落工作区，无需手工设环境变量。
 3. **PostToolUseFailure 无对应事件**（桥不支持 23 个 Claude 事件之一）：失败不计入停滞检测，停滞仅由重复/无进展触发。
-4. **Stop 载荷无收尾文本**（`last_assistant_message` 恒缺、`transcript_path` 恒空串）：引擎 2.5.0 起按此签名自适应，锚点/审批单打回自动降级为仅审计（`dsh-stop-observe` 留痕），避免桥接强制续跑死循环。
+4. **Stop 载荷无收尾文本**（`last_assistant_message` 恒缺、`transcript_path` 恒空串）：引擎 2.5.0 起按此签名自适应，2.5.2 起放宽为"**无收尾文本且 `transcript_path` 缺失或为空串**"，锚点/审批单打回一律降级为仅审计（`dsh-stop-observe` 留痕），避免桥接强制续跑死循环。
 5. **SessionStart 为 detached**：注入可能错过首个请求，从第二条消息起生效；批示关键词（50/15/10）随 UserPromptSubmit 正常工作。
 6. **configPath 只在进程加载时解析一次**，相对路径从启动目录解析——务必用绝对路径；修改后需重启 DSH。
 7. `--dry-run` 等特例语义与 ZCode 完全一致（同一引擎）。
@@ -102,11 +104,11 @@ marketplace 清单：.agents/plugins/ → .claude-plugin/ → .cursor-plugin/ �
 ### 3. 环境误判修复
 
 - 现象：Windows Git Bash 里 `grep ... | head -5` 被拦，提示"PowerShell 禁 bash 管道"等平台规则错误。
-- 原因：会话启动时 shell 检测误判（v2.0.1 已修：PSModulePath 机器级恒存不再判为 PowerShell，仅认 pwsh7 特征路径）。
-- 修复：①重开会话——环境检测为会话级一次复用，仅 shell 变化时重检，新会话必然重检；②应急：删除 `%TEMP%\focus-guard-<会话ID>.json` 强制重检；③仍误判：在 `.ai/CASE_FILE.md` 留痕后报 issue，判定逻辑集中在引擎 `quickShellId()`，可按机器特征调整。
+- 原因：会话启动时 shell 检测误判。判定链（`quickShellId()`）：先看 `SHELL`（bash/zsh/sh 分别识别），再看 `PSModulePath` 是否含**带版本号的 pwsh7 路径**（`…\PowerShell\<版本>\…`）或 Store 包路径（`…\WindowsApps\microsoft.powershell…`），最后看 `ComSpec`。2.0.1 修掉"机器级 PSModulePath 恒存即判 PowerShell"，2.5.2 进一步收窄为只认带版本/包路径（此前只写 `C:\Program Files\PowerShell\Modules` 也会误判）。
+- 修复：①重开会话——环境检测为会话级一次复用，仅 shell 变化时重检，新会话必然重检；②应急：删除 `%TEMP%\focus-guard-<会话ID>.json` 强制重检（会话 ID 经消毒，异常字符会带短哈希后缀）；③仍误判：在 `.ai/CASE_FILE.md` 留痕后报 issue，判定逻辑集中在引擎 `quickShellId()`，可按机器特征调整。
 - 反向误判（真 PowerShell 会话没被管）：属"宁宽勿严"设计，不堵工作流优先；可用 `Select-String` / `Measure-Object` / `-TotalCount` 的平台友好写法。
 
-### 4. 升级后版本没变（部署漂移：源码 2.5.1，运行副本仍是 2.4.0）
+### 4. 升级后版本没变（部署漂移：源码 2.5.2，运行副本仍是 2.4.0）
 
 - 表现：`.focus-guard/AUDIT.log` 的 `rules-registered` 事件仍记 `引擎v2.4.0`；`%USERPROFILE%\.zcode\cli\plugins\installed_plugins.json` 中 `focus-guard` 的 `version` / `installPath` 仍指向旧版；新会话注入带【部署版本核验】警告。
 - 原因：钩子运行的是**插件安装副本**（`...\.zcode\cli\plugins\cache\<市场名>\focus-guard\<版本>\`），改源码不会自动生效。
