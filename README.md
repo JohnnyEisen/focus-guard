@@ -1,6 +1,6 @@
 # FocusGuard 聚焦护栏
 
-[![CI](https://github.com/JohnnyEisen/focus-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnnyEisen/focus-guard/actions/workflows/ci.yml)
+
 **Node ≥ 18.17**（零依赖）· **MIT** · **ZCode 原生硬拦截** + **DSH 经官方桥硬拦截** · 当前 **v2.5.2**
 
 > 给 AI 编码智能体装上一套"纪律与监察系统"：日常对话零打扰，一旦出现未取证就改、结论无锚点、整读大文件烧上下文、无限空转等失控行为，立刻按梯度处罚——打回、强制取证、熔断、记档、降权、上报。所有执法行为全程留痕，人类随时可复核。
