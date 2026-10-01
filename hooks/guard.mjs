@@ -53,6 +53,9 @@ const TTL_STABLE = 7 * 86400e3; // 自适应：30天未变 7天
 
 const FUSE_PHRASE = "【熔断】无法通过现有资料定位核心问题";
 const FUSE_HINT = "1【最小复现】步骤/实验 2【联网证据】链接+原文 3【卡点记录】写HANDOFF.md"; // 各一行
+// 2.4.0：标准审批单（一行，禁长篇解释）
+const HIGH_RISK_FORM =
+  "【高危申请】命令：`<真实命令>` | 真实目的：<一句话> | 影响范围：<具体文件/表/系统> | 回滚方案：<可否回滚> | 允许执行？(y/n)";
 const MERCY_RE = /允许基于有限信息(进行)?猜测|(开启|启动|进入|批准|授予)绝境模式|【特赦】|(^|[\s，。！？,!?])特赦(?=$|[\s，。！？,!?])/;
 const CREDIT_RE = /继续|放行|延长/; // 信用延期批复（短指令）
 const STOP_ORDER_RE = /熔断|停止|^停$/; // 停止批复（短指令）
@@ -73,8 +76,48 @@ const FILE_REDIRECT_RE = /(^|\s)>{1,2}(?!\s*&)/;
 const PUSH_RE = /\bgit\s+(?:-[A-Za-z]\S*\s+)*(?:-c\s+\S+\s+)*push\b/i; // 2.2.0：git push（含 -C/-c 传参），--dry-run 例外
 const BACKUP_KEEP = 100; // 2.2.0：.ai/backup/ 最大保留份数（超出淘汰最旧）
 const DELEGATE_DEFAULT = 20; // 2.3.0：委托池默认额度（独立于执行池，批示『追加委托额度』+10）
-// 2.4.0 高危命令清单：即使完全访问也须人类审批（递归删除/强推/清盘/删库/断电/发包/容器清理）；普通单文件 rm 不在此列
-const HIGH_RISK_RE = /(\bsudo\b\s*)?\brm\b[^&|;]*\s-\w*r\w*|\brmdir\b[^&|;]*\/s|\bdel\b[^&|;]*\/s|\brd\b[^&|;]*\/s|Remove-Item\s[^&|;]*-Recurse|\bgit\s+push\b[^&|;]*(--force|\s-f\s)|\bgit\s+clean\b[^&|;]*-\w*f|\bmkfs\b|\bformat\s+[a-z]:|\bdiskpart\b|\bdd\b[^&|;]*of=\/dev\/|\bchmod\s+-R\b|\bicacls\b[^&|;]*\/grant|\bdrop\s+(table|database)\b|\btruncate\s+table\b|\breg\s+delete\b|\bshutdown\b|\bnpm\s+publish\b|\bpnpm\s+publish\b|\byarn\s+publish\b|\bdocker\s+(system\s+prune|volume\s+rm)/i;
+// 2.4.0 高危命令特征库（六类：破坏性删除/强制推送与历史覆盖/系统权限与配置篡改/全局依赖安装/对外发送与发布/数据库影响）
+// 即使完全访问（yolo）也须人类实时审批；普通单文件 rm、常规构建不在此列
+const DANGEROUS_PATTERNS = new RegExp([
+  "(?:sudo\\s+)?\\brm\\b[^&|;]*\\s-{1,2}\\w*r",
+  "\\brmdir\\b[^&|;]*/s",
+  "\\bdel\\b[^&|;]*/[fsq]",
+  "Remove-Item\\s[^&|;]*-Recurse",
+  "shutil\\.rmtree",
+  "drop\\s+table",
+  "truncate\\s+table",
+  "git\\s+push\\b(?!\\s+--dry-run)",
+  "git\\s+reset\\s+[^&|;]*--hard",
+  "git\\s+clean\\s+[^&|;]*-\\w*f",
+  "chmod\\s+[^&|;]*\\b777\\b",
+  "chmod\\s+-R",
+  "\\bchown\\b",
+  "\\breg\\s+add\\b",
+  "\\breg\\s+delete\\b",
+  "\\bnet\\s+user\\b.*\\b(add|delete)\\b",
+  "npm\\s+install\\s+(-g\\b|--global\\b)",
+  "pip3?\\s+install\\s+[^&|;]*(--global|--user)",
+  "apt(?:-get)?\\s+install",
+  "docker\\s+run\\b[^&|;]*--privileged",
+  "npm\\s+publish",
+  "pnpm\\s+publish",
+  "yarn\\s+publish",
+  "docker\\s+push",
+  "curl\\b[^&|;]*(-X\\s*POST|--request\\s+POST)",
+  "docker\\s+(system\\s+prune|volume\\s+rm)",
+  "mkfs",
+  "format\\s+[a-z]:",
+  "diskpart",
+  "\\bdd\\s+[^&|;]*of=/dev/",
+  "\\bshutdown\\b",
+].join("|"), "i");
+const SQL_NOWHERE_RE = /(^|[;]\s*)(delete\s+from|update)\s+[\w`."]+\s*(set\b|;|$)/i; // 2.4.0：无 where 的 DELETE/UPDATE
+const SCRIPT_FILE_RE = /\.(sh|ps1|bat|cmd|py|pl|rb|mjs|cjs|js)$/i; // 2.4.0：脚本包装检测范围
+function isDangerousCmd(cmd) {
+  const c = String(cmd || "");
+  if (/git\s+push\b(?!\s+--dry-run)/i.test(c)) return true;
+  return DANGEROUS_PATTERNS.test(c) || (SQL_NOWHERE_RE.test(c) && !/\bwhere\b/i.test(c));
+}
 
 const DOWNGRADE_MSG =
   "[触发⑤·熔断]改动类已拒（只读放行）。三选一各一行：" + FUSE_HINT +
@@ -218,9 +261,12 @@ function loadState(path) {
       caseCache: {},
       taskInitial: BUDGET_DEFAULT,
       pollutionFlagged: false,
-      pushAuthorized: false,
-      highRiskOk: false, // 2.4.0：高危命令本回合已获批示
+      goalPush: false, // 2.4.0：目标预授权（仅记录，不解锁执行）
+      highRiskOk: false, // 2.4.0：执行级授权（仅当回合人类短指令 y/同意 可设置）
       highRiskCmd: "", // 2.4.0：待批/已批的高危命令原文（逐字一致校验基准）
+      highRiskDeniedThisTurn: false, // 2.4.0：本回合发生过高危拒绝（收尾须带审批单）
+      rejectedCmds: {}, // 2.4.0：被人类 n 否决的命令（彻底阻断）
+      scriptFiles: {}, // 2.4.0：写入过的脚本文件 → 内容是否含高危命令（绕行检测）
       delegateBudget: DELEGATE_DEFAULT, // 2.3.0：委托池 granted 上限（只升不降）
       delegateUsed: 0, // 2.3.0：委托池累计消耗
       delegated: false, // 2.3.0：本任务是否已委派过
@@ -643,9 +689,9 @@ if (mode === "reset") {
   const grant = promptText.match(MERCY_RE);
   const mercy = !!(grant && promptText.trim().length <= MERCY_SHORT);
   if (mercy) audit(sid, "mercy-granted", { level: null, evidence: `批示原文: ${grant[0]}`, pardon: true });
-  // 2.3.0：人类本回合指令明示『上传/推送/push』且无否定前缀 → 推送批示（推送闸本回合放行）
-  const pushAuth = /上传|推送|push/i.test(promptText) && !/(不|禁|勿|别|暂|缓)[^，。；\n]{0,6}(上传|推送|push)/i.test(promptText);
-  if (pushAuth) audit(sid, "push-authorized", { level: null, evidence: "批示含推送语义，本回合推送闸放行", pardon: true });
+  // 2.4.0 三.1：目标预授权与执行级授权分离——任务指令里的『上传/推送』只记 goal，不解锁任何执行标记
+  const goalPush = /上传|推送|push/i.test(promptText) && !/(不|禁|勿|别|暂|缓)[^，。；\n]{0,6}(上传|推送|push)/i.test(promptText);
+  if (goalPush) audit(sid, "goal-preauth", { level: null, evidence: "goal=push-at-end（目标预授权，不构成执行级授权）" });
 
   // 总纲三：仅当明确探测到 shell 变化时重检环境
   if (state.envCache && state.envCache.shellIdKey && state.envCache.shellIdKey !== quickShellId()) {
@@ -679,10 +725,18 @@ if (mode === "reset") {
     audit(sid, "budget-extend", { level: null, evidence: `24条(三) 追加批示 budget=${state.taskBudget} invCap=${state.invCap} delegate=${state.delegateBudget}` });
   }
 
-  // 2.4.0：高危命令批准——人类短指令明示同意且有待批命令在案 → 本回合放行逐字一致的命令
-  const highRiskApproval = short.length <= MERCY_SHORT && /同意|批准|允许|可以|没问题|通过|执行吧|照办|ok|yes/i.test(short);
-  if (highRiskApproval && state.highRiskCmd) {
-    audit(sid, "high-risk-granted", { level: null, evidence: `批示原文: ${short} | 待批命令: ${String(state.highRiskCmd).slice(0, 120)}`, pardon: true });
+  // 2.4.0 二.3/4：实时审批——执行级授权只认人类当回合短指令：y 放行本次，n 彻底阻断
+  const yReply = short.length <= MERCY_SHORT && /^(y|yes|是|好|行|ok|同意|批准|允许|可以|没问题|通过)\b/i.test(short);
+  const nReply = short.length <= MERCY_SHORT && /^(n|no|不|不行|否|不要|拒绝|不许)\b/i.test(short);
+  if (yReply && state.highRiskCmd) {
+    state.highRiskOk = true;
+    audit(sid, "high-risk-approved", { level: null, evidence: `批示原文: ${short} | 待批: ${String(state.highRiskCmd).slice(0, 100)}`, pardon: true });
+  }
+  if (nReply && state.highRiskCmd) {
+    state.rejectedCmds = state.rejectedCmds || {};
+    state.rejectedCmds[String(state.highRiskCmd)] = 1;
+    audit(sid, "high-risk-rejected", { level: null, evidence: `批示原文: ${short} | 已彻底阻断: ${String(state.highRiskCmd).slice(0, 100)}` });
+    state.highRiskCmd = "";
   }
 
   // 43条 状态重置核验：上一回合残留 → 记档报告后清理（本事件随后统一重置）
@@ -708,8 +762,9 @@ if (mode === "reset") {
     fused: false,
     stopBlocked: false,
     mercy,
-    pushAuthorized: pushAuth, // 2.3.0：推送批示按回合生效
-    highRiskOk: highRiskApproval && !!state.highRiskCmd, // 2.4.0：高危批示按回合生效，须有待批命令
+    goalPush, // 2.4.0：目标预授权仅记录，不构成执行级授权
+    highRiskOk: yReply && !!state.highRiskCmd, // 2.4.0：执行级授权只认当回合人类短指令
+    highRiskDeniedThisTurn: false,
     violations: 0,
     forcedInvestigate: false,
     probation: false,
@@ -762,19 +817,6 @@ if (mode === "pre") {
         process.exit(2);
       }
     } catch {}
-  }
-
-  // 2.2.0 二.3/五.3：推送到远程属不可逆操作——本地 commit 测试全绿后 AI 可做，推送由人类执行。
-  // 放行通道：当回合人类短指令明示特赦（state.mercy），或人类本回合指令明示『上传/推送/push』（state.pushAuthorized）。
-  if (tool === "Bash" && !state.mercy && !state.pushAuthorized) {
-    const cmd = String(ti.command || "");
-    if (PUSH_RE.test(cmd) && !/--dry-run\b/.test(cmd)) {
-      audit(sid, "deny-push", { level: null, evidence: `二.3 推送闸 ${cmd.slice(0, 100)}` });
-      process.stderr.write(
-        "[不可逆·推送闸]推送由人类执行。本地 commit 后输出一行【提交申请】等批示；人类本回合明示『上传/推送』即构成推送批示。"
-      );
-      process.exit(2);
-    }
   }
 
   if (tool === "Agent") {
@@ -830,19 +872,70 @@ if (mode === "pre") {
 
   const mutating = isMutating(tool, ti, handoff);
 
-  // 2.4.0 高危命令闸：完全访问下 rm 类命令仍须先申请、人类批示，批准后逐字一致才放行
-  if (tool === "Bash" && HIGH_RISK_RE.test(String(ti.command || ""))) {
+  // ===== 2.4.0 高危命令闸（统一推送/删除/清盘/发布/包装绕行）：完全访问也须实时审批 =====
+  if (tool === "Bash") {
     const cmdStr = String(ti.command || "");
-    if (state.highRiskOk && state.highRiskCmd === cmdStr) {
-      audit(sid, "high-risk-approved", { level: null, evidence: `2.4.0 已批高危命令执行 ${cmdStr.slice(0, 120)}` });
-    } else {
-      state.highRiskCmd = cmdStr.slice(0, 300);
-      saveState(path, state);
-      audit(sid, "high-risk-request", { level: null, evidence: `2.4.0 高危命令待批 ${cmdStr.slice(0, 120)}` });
-      process.stderr.write(
-        "[高危命令闸]删除/强推/清盘/发布类命令即使完全访问也须人类审批。先输出【高危命令申请】：命令原文＋目标与影响＋理由，等批示（同意/批准）。批示后原样重发同一命令即放行；改动命令须重新申请。"
-      );
-      process.exit(2);
+    const scriptHits = (cmdStr.match(/[\w.\\\/-]+\.(sh|ps1|bat|cmd|py|pl|rb|mjs|cjs|js)\b/ig) || [])
+      .map((t) => normalize(t))
+      .filter((t) => (state.scriptFiles || {})[t] === "d");
+    if (isDangerousCmd(cmdStr) || scriptHits.length) {
+      if ((state.rejectedCmds || {})[cmdStr]) {
+        audit(sid, "high-risk-rejected", { level: null, evidence: `2.4.0 已否决命令再次尝试 ${cmdStr.slice(0, 120)}` });
+        process.stderr.write("[高危命令闸·已否决]该命令已被人类批示 n，彻底阻断。如需变体，重新走【高危申请】。");
+        process.exit(2);
+      }
+      if (state.highRiskOk && state.highRiskCmd === cmdStr) {
+        state.highRiskOk = false; // 放行本次（一次性）
+        state.highRiskCmd = "";
+        saveState(path, state);
+        audit(sid, "high-risk-executed", { level: null, evidence: `2.4.0 已批高危命令执行 ${cmdStr.slice(0, 120)}` });
+      } else if (state.highRiskDeniedThisTurn && scriptHits.length) {
+        const level = penalize(state, sid, "violation-wrap-bypass", `2.4.0 脚本包装绕过 ${scriptHits.join(",").slice(0, 80)}`);
+        saveState(path, state);
+        process.stderr.write(
+          `[对抗审查·L${level}]高危命令被拒后改写脚本执行，按对抗审查记档。要执行请走【高危申请】审批，不得绕行。${ladderNote(level)}`
+        );
+        process.exit(2);
+      } else {
+        state.highRiskCmd = cmdStr.slice(0, 300);
+        state.highRiskDeniedThisTurn = true;
+        saveState(path, state);
+        audit(sid, "high-risk-request", { level: null, evidence: `2.4.0 高危命令待批 ${cmdStr.slice(0, 120)}` });
+        process.stderr.write(
+          "[高危命令闸]命中高危特征库（删除/推送/清盘/发布/全局安装等），即使完全访问也须人类实时审批。" +
+            `输出一行审批单：${HIGH_RISK_FORM} 人类回复 y 放行本次、n 彻底阻断；严禁改写脚本绕行（按对抗审查 L4 记档）。`
+        );
+        process.exit(2);
+      }
+    }
+  }
+  // 2.4.0：写脚本文件且内容含高危命令 → 写入本身走审批（源头拦包装）；被拒后继续写 → 对抗审查 L4
+  if (/^(Write|Edit)$/.test(tool) && !handoff && filePath && SCRIPT_FILE_RE.test(filePath)) {
+    const body = String(ti.content ?? "") + String(ti.new_string ?? "");
+    if (isDangerousCmd(body)) {
+      const key = ("write:" + filePath).slice(0, 300);
+      if (state.highRiskOk && state.highRiskCmd === key) {
+        state.highRiskOk = false;
+        state.highRiskCmd = "";
+        saveState(path, state);
+        audit(sid, "high-risk-executed", { level: null, evidence: `2.4.0 已批高危脚本写入 ${filePath}` });
+      } else if (state.highRiskDeniedThisTurn) {
+        const level = penalize(state, sid, "violation-wrap-bypass", `2.4.0 脚本包装绕过(写入) ${filePath}`);
+        saveState(path, state);
+        process.stderr.write(
+          `[对抗审查·L${level}]高危命令被拒后改写脚本继续，按对抗审查记档。要写入请走【高危申请】审批，不得绕行。${ladderNote(level)}`
+        );
+        process.exit(2);
+      } else {
+        state.highRiskCmd = key;
+        state.highRiskDeniedThisTurn = true;
+        saveState(path, state);
+        audit(sid, "high-risk-request", { level: null, evidence: `2.4.0 高危脚本写入待批 ${filePath}` });
+        process.stderr.write(
+          `[高危命令闸]脚本内容含高危命令，写入同样须审批。${HIGH_RISK_FORM}（命令填：写入 ${filePath}），人类回复 y 后原样重发写入即可。`
+        );
+        process.exit(2);
+      }
     }
   }
 
@@ -986,6 +1079,12 @@ if (mode === "post" || mode === "postfail") {
   if (mode === "post") {
     state.readSet = state.readSet || {};
     if (ti.file_path && ["Read", "Write", "Edit"].includes(tool)) state.readSet[normalize(ti.file_path)] = 1;
+    // 2.4.0：登记写入过的脚本文件及内容危险性（供脚本包装绕行检测）
+    if ((tool === "Write" || tool === "Edit") && ti.file_path && SCRIPT_FILE_RE.test(String(ti.file_path))) {
+      state.scriptFiles = state.scriptFiles || {};
+      const body = String(ti.content ?? "") + String(ti.old_string ?? "") + String(ti.new_string ?? "");
+      state.scriptFiles[normalize(ti.file_path)] = isDangerousCmd(body) ? "d" : "c";
+    }
     if (tool === "Grep" && typeof ti.path === "string") state.readSet[normalize(ti.path)] = 1;
     // ===== 2.0 总纲四/七：更新侦查取证记录（指纹 + TTL 依据）=====
     if (tool === "Read" && ti.file_path) {
@@ -1305,6 +1404,24 @@ if (mode === "stop") {
       `[触发⑤]熔断已触发未交代。输出『${FUSE_PHRASE}』+三行降级方案，禁静默结束。`
     );
     process.exit(0);
+  }
+
+  // 2.4.0 二.2：高危拒绝后收尾必须带标准审批单（格式校验，缺字段即打回）
+  if (state.highRiskDeniedThisTurn) {
+    const formOk =
+      /【高危申请】/.test(text) &&
+      /命令[:：]/.test(text) &&
+      /真实目的[:：]/.test(text) &&
+      /影响范围[:：]/.test(text) &&
+      /回滚方案[:：]/.test(text) &&
+      /允许执行\s*[?？]\s*[（(]y\/n[)）]/.test(text);
+    if (!formOk) {
+      state.turnCount = 0;
+      saveState(path, state);
+      audit(sid, "reject-no-form", { level: null, evidence: "2.4.0 高危拒绝后未输出标准审批单" });
+      block(`[高危申请缺失]本回合拒绝了高危命令，收尾必须输出标准审批单（一行，禁长篇解释）：${HIGH_RISK_FORM}`);
+      process.exit(0);
+    }
   }
 
   state.unknownStreak = 0;
