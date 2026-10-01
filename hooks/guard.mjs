@@ -85,6 +85,7 @@ const DANGEROUS_PATTERNS = new RegExp([
   "Remove-Item\\s[^&|;]*-Recurse",
   "shutil\\.rmtree",
   "drop\\s+table",
+  "drop\\s+database",
   "truncate\\s+table",
   "git\\s+(?:-{1,2}[A-Za-z-][\\S]*\\s+\\S+\\s+)*push\\b(?!\\s+--dry-run)",
   "git\\s+reset\\s+[^&|;]*--hard",
