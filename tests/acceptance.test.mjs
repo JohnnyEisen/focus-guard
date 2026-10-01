@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { writeFileSync, readFileSync, rmSync, mkdirSync, utimesSync, statSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync, mkdirSync, utimesSync, statSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -516,5 +516,63 @@ describe("DSH 版（v2.0.2，CS2 modding 适配）", () => {
     const s = stateOf("dsh-case");
     assert.equal(Object.keys(s.caseCache || {}).length, 0); // 空记录载入
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("正面指引（v2.2.0）", () => {
+  test("推送闸：git push 拒绝并指引人类 UI 推送；--dry-run 与当回合特赦放行", () => {
+    const run = makeRunner("push-gate");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    const r = run("pre", { tool_name: "Bash", tool_input: { command: "git push origin main" } });
+    assert.equal(r.rc, 2);
+    assert.ok(r.out.includes("推送闸"));
+    assert.ok(r.out.includes("提交申请"));
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "git push --dry-run origin main" } }).rc, 0);
+    run("reset", { prompt: "【特赦】" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r2.txt", limit: 5 }, tool_response: { content: "v2" } }); // 特赦不豁免取证纪律
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "git push origin main" } }).rc, 0);
+  });
+
+  test("污染核实闸：输出矛盾检出后首个改动类先拦一次，重试放行", () => {
+    const run = makeRunner("pollute-gate");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    run("post", {
+      tool_name: "Bash",
+      tool_input: { command: "git ls-files | head -3" },
+      tool_response: { content: "a.js\nb.js\nc.js\nd.js" },
+    });
+    const r = run("pre", { tool_name: "Edit", tool_input: { file_path: "r.txt", old_string: "a", new_string: "b" } });
+    assert.equal(r.rc, 2);
+    assert.ok(r.out.includes("污染核实"));
+    assert.equal(run("pre", { tool_name: "Edit", tool_input: { file_path: "r.txt", old_string: "a", new_string: "b" } }).rc, 0);
+  });
+
+  test("改动前自动备份到 .ai/backup/（无 .git 工作区的回滚依据）", () => {
+    const run = makeRunner("backup22");
+    const dir = freshDir();
+    const f = join(dir, "code.txt");
+    writeFileSync(f, "v1");
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "v1" } });
+    assert.equal(r("pre", { tool_name: "Edit", tool_input: { file_path: f, old_string: "v1", new_string: "v2" } }).rc, 0);
+    const bd = join(dir, ".ai", "backup");
+    const backups = readdirSync(bd).filter((x) => x.endsWith(".bak"));
+    assert.equal(backups.length, 1);
+    assert.equal(readFileSync(join(bd, backups[0]), "utf8"), "v1");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("熔断出口提示经验固化（PATTERNS.md）", () => {
+    const run = makeRunner("fuse-pattern");
+    run("reset", { prompt: "看看情况" });
+    const same = { tool_name: "Read", tool_input: { file_path: "same.txt", limit: 5 }, tool_response: { content: "一成不变" } };
+    run("post", same); run("post", same); run("post", same);
+    writeState("fuse-pattern", { fused: true });
+    const r = run("pre", { tool_name: "Write", tool_input: { file_path: "new.py" } });
+    assert.equal(r.rc, 2);
+    assert.ok(r.out.includes("PATTERNS.md"));
   });
 });
