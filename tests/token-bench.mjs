@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 // token-bench：测量护栏事件流中"模型可见输出"的体量（stdout=block 注入 / stderr=拒绝注入）。
 // AUDIT.log 与卷宗写盘不进模型上下文，不计入。字符数按 1 token≈1.5 中文字符（区间 1.2~2.0）折算。
 // 用法：node tests/token-bench.mjs <引擎A.mjs> [引擎B.mjs]   （B 为对照基线时输出对比表）
@@ -149,3 +149,6 @@ for (const sc of SCENARIOS) {
 console.log(`--- 典型会话加权合计（chars）: 基线=${wa} 优化后=${wb} 节省=${div(wb, wa)} ---`);
 const tok = (c) => `≈${Math.round(c / 1.5)} tokens（按1≈1.5字，区间${Math.round(c / 2.0)}~${Math.round(c / 1.2)}）`;
 console.log(`--- 典型会话 token 估算: 基线${tok(wa)} → 优化后${tok(wb)} ---`);
+
+// 清理本次运行在系统临时目录留下的 fixture（此前每次运行漏一个目录）
+rmSync(fixtures, { recursive: true, force: true });

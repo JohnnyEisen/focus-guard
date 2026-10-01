@@ -1,6 +1,6 @@
-import { test, describe } from "node:test";
+import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { writeFileSync, readFileSync, rmSync, mkdirSync, utimesSync, statSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,13 +15,17 @@ function freshDir() {
   return dir;
 }
 function makeRunner(sid) {
-  // 无 ZCODE_PROJECT_DIR → 审计日志退回系统临时目录，测试间相互隔离
+  // 无 ZCODE_PROJECT_DIR → 审计日志退回系统临时目录，测试间相互隔离。
+  // 2.5.2：改用 spawnSync 同时捕获 stdout + stderr。此前用 execFileSync，rc=0 时只拿得到 stdout，
+  // 于是"零打扰"断言（assert.equal(out, "")）看不见被放行的调用偷偷写 stderr 的干扰——
+  // 而 token-bench 恰恰把 stdout+stderr 都算作模型可见开销，两把尺子不一致。
   const run = (mode, obj, env) => {
-    try {
-      return { rc: 0, out: execFileSync("node", [GUARD, mode], { input: JSON.stringify({ ...obj, session_id: `${obj.session_id || sid}-${RUN}` }), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...env } }).trim() };
-    } catch (e) {
-      return { rc: e.status, out: ((e.stderr || "") + (e.stdout || "")).trim() };
-    }
+    const p = spawnSync("node", [GUARD, mode], {
+      input: JSON.stringify({ ...obj, session_id: `${obj.session_id || sid}-${RUN}` }),
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    });
+    return { rc: p.status, out: ((p.stdout || "") + (p.stderr || "")).trim() };
   };
   // 绑定工作区：卷宗/审计落该目录（总纲二）
   run.in = (dir) => (mode, obj) => run(mode, obj, { ZCODE_PROJECT_DIR: dir });
@@ -35,6 +39,18 @@ const writeState = (sid, patch) => {
   writeFileSync(p, JSON.stringify({ ...base, ...patch }));
 };
 const caseFileOf = (dir) => readFileSync(join(dir, ".ai", "CASE_FILE.md"), "utf8");
+
+// 2.5.2：跑完清理本次运行在系统临时目录留下的状态/审计文件。
+// 此前一次全量验收会在 %TEMP% 留 ~190 个文件，长年累积无上限。
+after(() => {
+  for (const f of readdirSync(tmpdir())) {
+    if (f.startsWith("focus-guard-") && f.includes(RUN)) {
+      try {
+        rmSync(join(tmpdir(), f), { force: true });
+      } catch {}
+    }
+  }
+});
 
 describe("动态预算", () => {
   test("批示关键词设定初始预算", () => {
@@ -106,6 +122,21 @@ describe("进度检测", () => {
     assert.equal(after.stalledStreak, 0);
     assert.equal(after.taskBudget, before + 10);
   });
+
+  test("postfail：失败调用计入无效调用并触发停滞熔断", () => {
+    const run = makeRunner("postfail-x");
+    run("reset", { prompt: "看看情况" });
+    const fail = { tool_name: "Bash", tool_input: { command: "node missing-file.js" } };
+    run("postfail", fail);
+    assert.equal(stateOf("postfail-x").stalledStreak, 1);
+    assert.equal(stateOf("postfail-x").ineffCalls, 1);
+    run("postfail", fail);
+    assert.equal(stateOf("postfail-x").stalledStreak, 2);
+    run("postfail", fail);
+    const s = stateOf("postfail-x");
+    assert.equal(s.stalledStreak, 3);
+    assert.equal(s.fused, true, "连续 3 次失败应判真失控熔断");
+  });
 });
 
 describe("履职纪律", () => {
@@ -144,6 +175,95 @@ describe("履职纪律", () => {
     run("reset", { session_id: "mercy-long", prompt: "关于绝境模式的说明文档里提到启动绝境模式时应当如何如何的一大段协议引用文本超过三十个字符" });
     assert.equal(stateOf("mercy-long").mercy, false);
   });
+
+  test("熔断声明缺降级方案：只打回一次（防宿主强制续跑死循环）", () => {
+    const run = makeRunner("fuse-oneshot");
+    run("reset", { prompt: "看看情况" });
+    writeState("fuse-oneshot", { fused: true });
+    const first = run("stop", { response: "【熔断】无法通过现有资料定位核心问题" });
+    assert.ok(first.out.includes("decision"), "首次应打回并要求三行降级方案");
+    assert.equal(stateOf("fuse-oneshot").stopBlocked, true);
+    const second = run("stop", { response: "【熔断】无法通过现有资料定位核心问题" });
+    assert.equal(second.out, "", "同一回合不得反复打回（桥接无连败上限会死循环）");
+  });
+
+  test("熔断期不放行高危命令（L3 只读白名单不得成为免检通道）", () => {
+    const run = makeRunner("fuse-highrisk");
+    run("reset", { prompt: "看看情况" });
+    writeState("fuse-highrisk", { fused: true });
+    for (const c of ["npm publish", 'python -c "import shutil;shutil.rmtree(1)"', "reg add HKLM\\X /v y /d z", "diskpart"]) {
+      const r = run("pre", { tool_name: "Bash", tool_input: { command: c } });
+      assert.equal(r.rc, 2, `${c} 在熔断期必须被拒`);
+      assert.ok(r.out.includes("熔断期·高危命令"), `${c} 应给出熔断期高危拒绝理由`);
+    }
+    assert.equal(run("pre", { tool_name: "Read", tool_input: { file_path: "x.txt", limit: 5 } }).rc, 0, "只读调查仍应放行");
+  });
+
+  test("变更类命令识别：sudo/xargs 前缀与 cp 不再被当成只读侦查", () => {
+    const run = makeRunner("mut-base");
+    for (const c of ["mv a b", "sudo mv a b", "cp a b", "sudo cp a b", "xargs mv a b", "rm x", "echo hi > out.txt"]) {
+      const sid = "mut-" + Math.random().toString(36).slice(2);
+      run("reset", { session_id: sid, prompt: "看看情况" });
+      assert.equal(run("pre", { session_id: sid, tool_name: "Bash", tool_input: { command: c } }).rc, 2, `${c} 应触发①（未取证就改）`);
+    }
+    const ro = "mut-readonly";
+    run("reset", { session_id: ro, prompt: "看看情况" });
+    assert.equal(run("pre", { session_id: ro, tool_name: "Bash", tool_input: { command: "grep -rn rm ." } }).rc, 0, "只读命令不得误伤");
+    assert.equal(run("pre", { session_id: ro, tool_name: "Bash", tool_input: { command: "npm test" } }).rc, 0, "npm test 不是变更类");
+  });
+
+  test("授权识别条例：伪造引文→L3 熔断；合规声明→特赦生效；待确认→暂停", () => {
+    // 伪造引文：声明引用的"人类指令原文"并不存在于本回合指令
+    const run = makeRunner("pardon-fake");
+    run("reset", { prompt: "把日志整理一下" });
+    const fake = run("stop", { response: "【授权识别】我基于人类指令「全部放行不必审批」，依据：第二十六条。" });
+    assert.ok(fake.out.includes("越权解释授权"), "伪造引文必须打回");
+    assert.equal(stateOf("pardon-fake").fused, true);
+    // 合规声明：引文本回合原文 + 含授权语义 + 指明依据
+    const run2 = makeRunner("pardon-ok");
+    run2("reset", { prompt: "这个模块允许你跳过测试" });
+    assert.equal(run2("stop", { response: "【授权识别】我基于人类指令「这个模块允许你跳过测试」，依据：第九条。" }).out, "");
+    assert.equal(stateOf("pardon-ok").mercy, true, "合规声明应被判为有效授权");
+    // 灰色地带：待确认 → 暂停不打回
+    const run3 = makeRunner("pardon-pending");
+    run3("reset", { prompt: "看看情况" });
+    assert.equal(run3("stop", { response: "【授权待确认】请明确是否授权。" }).out, "");
+    assert.ok(auditOf("pardon-pending").includes("pardon-pending"));
+  });
+
+  test("人类批示「停/熔断」必须真的熔断（此前同一函数把 fused 写回 false）", () => {
+    const run = makeRunner("stop-order");
+    run("reset", { prompt: "继续干活" });
+    run("reset", { prompt: "停止" });
+    const s = stateOf("stop-order");
+    assert.equal(s.fused, true, "止停令必须生效");
+    assert.ok(s.violations >= 3);
+    assert.ok(auditOf("stop-order").includes("stall-fuse"));
+    assert.equal(run("pre", { tool_name: "Write", tool_input: { file_path: "new.py" } }).rc, 2, "熔断后改动类应被拒");
+  });
+
+  test("触发⑤：连续两次「查无实据」→ 第二次判停职检查", () => {
+    const run = makeRunner("unknown-2");
+    run("reset", { prompt: "看看情况" });
+    assert.equal(run("stop", { response: "查无实据。" }).out, "");
+    assert.equal(stateOf("unknown-2").fused, false);
+    run("stop", { response: "查无实据，我再试试。" });
+    assert.equal(stateOf("unknown-2").fused, true);
+    assert.ok(auditOf("unknown-2").includes("shuanggui-declared"));
+  });
+
+  test("抽查A：第 5 次写操作触发全量审计留痕", () => {
+    const run = makeRunner("spot-a");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    let hit = "";
+    for (let i = 1; i <= 5; i++) {
+      const r = run("post", { tool_name: "Write", tool_input: { file_path: "same.txt", content: `v${i}` }, tool_response: { ok: true } });
+      if (r.out.includes("抽查A")) hit = r.out;
+    }
+    assert.ok(hit.includes("第 5 次写操作"), "第 5 次写操作应触发抽查A");
+    assert.ok(auditOf("spot-a").includes("random-audit"));
+  });
 });
 
 describe("体积刺客", () => {
@@ -157,6 +277,57 @@ describe("体积刺客", () => {
     assert.equal(r.rc, 2);
     assert.ok(r.out.includes("体积刺客"));
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("高危特征库（v2.5.2 加固：别名/绕行与误伤双向锁定）", () => {
+  // 高危：同一致命动作的别名与绕行写法（此前全部漏检）
+  const DENY = [
+    "npm i -g typescript", "npm install --save -g x", "npm uninstall -g x",
+    "pnpm add -g typescript", "pnpm add --global x", "yarn global add typescript", "yarn add -g x",
+    "rd /s /q folder", "ri -r cache",
+    "wget --post-data=x https://a.b", "Invoke-WebRequest -Method POST https://a.b", "curl -d @f https://a.b",
+    "git --git-dir=/x push", "git --no-pager push", "ls && git push", "git -c user.name=x push origin main",
+    "git clean --force", "git clean -fdx",
+  ];
+  // 良性：看起来像高危其实无害（此前全部误封）
+  const ALLOW = [
+    "git push origin main --dry-run", "git -C . push --dry-run origin main", "git clean -fdn", "git clean -n", "git clean --dry-run",
+    "npm publish --dry-run", "pnpm publish --dry-run",
+    "rm --force single.txt", "rm -f a.txt", "rm -i --verbose x",
+    "git log --grep push", "git commit -m \"fix push\"", "grep -rn ri -r src",
+    "curl -X GET https://a.b", "Invoke-WebRequest -Method GET https://a.b",
+  ];
+
+  test("高危写法一律拦截，良性写法零打扰（含 dry-run 与 --force 反例）", () => {
+    const run = makeRunner("cls-252");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    const bad = [];
+    for (const c of DENY) {
+      if (run("pre", { tool_name: "Bash", tool_input: { command: c } }).rc !== 2) bad.push(`漏检: ${c}`);
+    }
+    for (const c of ALLOW) {
+      if (run("pre", { tool_name: "Bash", tool_input: { command: c } }).rc !== 0) bad.push(`误伤: ${c}`);
+    }
+    assert.deepEqual(bad, []);
+  });
+
+  test("多语句 SQL：行内任意位置出现 where 不再放过无 where 的删除（按语句判定）", () => {
+    const run = makeRunner("sql-multi");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    const multi = 'mysql -e "delete from users; select 1 from dual where 1=1"';
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: multi } }).rc, 2, "首条语句无 where，仍须审批");
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: 'mysql -e "delete from users where id=1"' } }).rc, 0, "带 where 不设卡");
+  });
+
+  test("curl 的 -d 与 -D 必须区分（小写 -d 才是发送数据）", () => {
+    const run = makeRunner("curl-case");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "curl -d @f https://a.b" } }).rc, 2, "-d 是发送数据");
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "curl -D - https://a.b" } }).rc, 0, "-D 是 dump 响应头，属只读");
   });
 });
 
@@ -465,10 +636,14 @@ describe("跨平台命令拦截（总纲六）", () => {
 
   test("macOS 会话：禁 sed -i 无后缀 / grep -P / readlink -f", () => {
     const run = makeRunner("plat-mac");
-    writeState("plat-mac", { envCache: { os: "darwin", shellIdKey: "bash" }, envChecked: true });
-    assert.ok(run("pre", { tool_name: "Bash", tool_input: { command: "sed -i s/a/b/ f.txt" } }).out.includes("sed -i"));
-    assert.ok(run("pre", { tool_name: "Bash", tool_input: { command: "grep -P '\\d' f.txt" } }).out.includes("-P"));
-    assert.ok(run("pre", { tool_name: "Bash", tool_input: { command: "readlink -f ./x" } }).out.includes("readlink"));
+    writeState("plat-mac", { envCache: { os: "darwin", shellIdKey: "bash" } });
+    // sed -i 属变更类（2.5.2 纳入触发①判定），故先取证隔离触发①，只验证平台规则本身
+    run("post", { tool_name: "Read", tool_input: { file_path: "f.txt", limit: 5 }, tool_response: { content: "v" } });
+    for (const [cmd, hint] of [["sed -i s/a/b/ f.txt", "sed -i"], ["grep -P '\\d' f.txt", "-P"], ["readlink -f ./x", "readlink"]]) {
+      const r = run("pre", { tool_name: "Bash", tool_input: { command: cmd } });
+      assert.equal(r.rc, 2, `${cmd} 应被平台规则拒绝（不能只检查提示文案）`);
+      assert.ok(r.out.includes(hint));
+    }
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "sed -i '' s/a/b/ f.txt" } }).rc, 0);
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "grep -E '\\d' f.txt" } }).rc, 0);
   });
@@ -516,6 +691,30 @@ describe("环境检测防误判（2.0.1）", () => {
     const run = makeRunner("env-nops");
     writeState("env-nops", { envCache: { os: "win32", shellIdKey: "cmd" }, envChecked: true });
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "grep -rn x . | head -5" } }).rc, 0);
+  });
+
+  test("机器级 PowerShell 模块路径（不带版本号）不再误判为 PowerShell 会话", () => {
+    const run = makeRunner("env-machine-ps");
+    const dir = freshDir();
+    run("start", { session_id: "env-machine-ps" }, {
+      ZCODE_PROJECT_DIR: dir,
+      SHELL: "",
+      PSModulePath: "C:\\Program Files\\PowerShell\\Modules;C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\Modules",
+    });
+    assert.notEqual(stateOf("env-machine-ps").envCache.shellIdKey, "powershell", "仅凭机器级模块路径不得判定为 PowerShell 会话");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("reset 探测到 shell 变化 → 重检环境并留痕（此前该分支无覆盖）", () => {
+    const run = makeRunner("env-switch");
+    const dir = freshDir();
+    run("start", { session_id: "env-switch" }, { ZCODE_PROJECT_DIR: dir, SHELL: "/bin/bash" });
+    const before = stateOf("env-switch").envCache.shellIdKey;
+    assert.equal(before, "bash");
+    run("reset", { session_id: "env-switch", prompt: "看看情况" }, { ZCODE_PROJECT_DIR: dir, SHELL: "/bin/zsh" });
+    assert.equal(stateOf("env-switch").envCache.shellIdKey, "zsh", "shell 变化必须触发重检");
+    assert.ok(readFileSync(join(dir, ".focus-guard", "AUDIT.log"), "utf8").includes("env-redetect"));
+    rmSync(dir, { recursive: true, force: true });
   });
 });
 
@@ -583,6 +782,29 @@ describe("正面指引（v2.2.0）", () => {
     const backups = readdirSync(bd).filter((x) => x.endsWith(".bak"));
     assert.equal(backups.length, 1);
     assert.equal(readFileSync(join(bd, backups[0]), "utf8"), "v1");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("敏感文件不落明文备份：.env / 私钥跳过并留痕，普通文件照常备份", () => {
+    const run = makeRunner("backup-secret");
+    const dir = freshDir();
+    const secret = join(dir, ".env");
+    const key = join(dir, "server.pem");
+    const normal = join(dir, "app.js");
+    writeFileSync(secret, "TOKEN=s3cret");
+    writeFileSync(key, "-----BEGIN PRIVATE KEY-----");
+    writeFileSync(normal, "console.log(1)");
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    for (const f of [secret, key, normal]) {
+      r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "x" } });
+      r("pre", { tool_name: "Edit", tool_input: { file_path: f, old_string: "x", new_string: "y" } });
+    }
+    const names = readdirSync(join(dir, ".ai", "backup"), { recursive: true }).map(String);
+    assert.ok(names.some((n) => n.includes("app.js")), "普通文件应照常备份");
+    assert.ok(!names.some((n) => n.includes(".env")), "敏感文件不得落明文副本");
+    assert.ok(!names.some((n) => n.includes("server.pem")), "私钥不得落明文副本");
+    assert.ok(readFileSync(join(dir, ".focus-guard", "AUDIT.log"), "utf8").includes("backup-skip-secret"));
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -775,6 +997,74 @@ describe("高危命令闸（v2.4.0）", () => {
     run("reset", { prompt: "这个问题我们先讨论一下别的，稍后再说" }); // 长句不构成执行级授权
     assert.equal(stateOf("goal1").highRiskOk, false);
   });
+
+  test("超长命令（>300 字符）的 y/n 仍生效（比对用全量哈希，不受展示截断影响）", () => {
+    const long = "rm -rf /tmp/" + "a".repeat(400);
+    const run = makeRunner("hr-long");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: long } }).rc, 2);
+    assert.ok(stateOf("hr-long").highRiskCmd.length <= 300, "展示文本应截断");
+    assert.ok(stateOf("hr-long").highRiskKey.length > 0, "比对键必须存在");
+    run("reset", { prompt: "y" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r2.txt", limit: 5 }, tool_response: { content: "v2" } }); // 新回合照常先取证
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: long } }).rc, 0, "y 必须能放行超长命令");
+
+    const run2 = makeRunner("hr-long-n");
+    run2("reset", { prompt: "看看情况" });
+    run2("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    assert.equal(run2("pre", { tool_name: "Bash", tool_input: { command: long } }).rc, 2);
+    run2("reset", { prompt: "n" });
+    run2("post", { tool_name: "Read", tool_input: { file_path: "r2.txt", limit: 5 }, tool_response: { content: "v2" } });
+    const blocked = run2("pre", { tool_name: "Bash", tool_input: { command: long } });
+    assert.equal(blocked.rc, 2);
+    assert.ok(blocked.out.includes("已否决"), "n 必须能彻底阻断超长命令");
+  });
+
+  test("中文批示词生效（同意/批准 放行；不/拒绝 彻底阻断）", () => {
+    const cases = [["同意", true], ["批准", true], ["y", true], ["不", false], ["拒绝", false], ["n", false]];
+    let i = 0;
+    for (const [reply, expectOk] of cases) {
+      const sid = `cn-${expectOk ? "y" : "n"}-${i++}`;
+      const run = makeRunner(sid);
+      run("reset", { prompt: "看看情况" });
+      run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+      assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "git push" } }).rc, 2);
+      run("reset", { prompt: reply });
+      const s = stateOf(sid);
+      if (expectOk) assert.equal(s.highRiskOk, true, `「${reply}」应构成放行批示`);
+      else assert.equal(Object.keys(s.rejectedCmds || {}).length, 1, `「${reply}」应构成彻底阻断`);
+    }
+  });
+
+  test("高危拒绝后收尾缺审批单：只打回一次（防无限重复打回）", () => {
+    const run = makeRunner("hr-form-once");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    run("pre", { tool_name: "Bash", tool_input: { command: "git push" } });
+    const first = run("stop", { response: "已完成本地提交。" });
+    assert.ok(first.out.includes("高危申请缺失"), "首次应打回补审批单");
+    assert.equal(stateOf("hr-form-once").stopBlocked, true);
+    const second = run("stop", { response: "已完成本地提交。" });
+    assert.equal(second.out, "", "同一回合不得反复打回");
+  });
+
+  test("脚本包装防护端到端：post 真实登记危险脚本 → 执行被拦（不靠预置 state）", () => {
+    const run = makeRunner("wrap-e2e");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    // 干净脚本：写入放行，post 登记为 c
+    assert.equal(run("pre", { tool_name: "Write", tool_input: { file_path: "ok.sh", content: "echo hi" } }).rc, 0);
+    run("post", { tool_name: "Write", tool_input: { file_path: "ok.sh", content: "echo hi" }, tool_response: { ok: true } });
+    assert.equal(stateOf("wrap-e2e").scriptFiles["ok.sh"], "c");
+    // 危险脚本：写入本身被拦；post 走真实路径登记为 d
+    assert.equal(run("pre", { tool_name: "Write", tool_input: { file_path: "danger.sh", content: "rm -rf ./dist" } }).rc, 2);
+    run("post", { tool_name: "Write", tool_input: { file_path: "danger.sh", content: "rm -rf ./dist" }, tool_response: { ok: true } });
+    assert.equal(stateOf("wrap-e2e").scriptFiles["danger.sh"], "d", "危险脚本必须被登记为 d（此前该登记路径无任何测试）");
+    // 执行：危险脚本被拦，干净脚本放行
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "bash danger.sh" } }).rc, 2);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "bash ok.sh" } }).rc, 0);
+  });
 });
 
 describe("极限场景（v2.4.1）", () => {
@@ -803,16 +1093,28 @@ describe("极限场景（v2.4.1）", () => {
     assert.ok(r.out.includes("体积刺客"));
   });
 
-  test("状态健壮性：损坏的 state JSON 自动降级默认值；奇异会话 ID 消毒", () => {
+  test("状态健壮性：损坏的 state JSON 自动降级默认值；奇异会话 ID 消毒且不撞名", () => {
     const run = makeRunner("ext-corrupt");
     writeFileSync(join(tmpdir(), `focus-guard-ext-corrupt-${RUN}.json`), "{corrupted json!!");
     run("reset", { prompt: "看看情况" });
-    assert.equal(stateOf("ext-corrupt").taskBudget, 10);
+    const d = stateOf("ext-corrupt");
+    assert.equal(d.taskBudget, 10);
+    // 只断言 taskBudget 是无效的：reset 会用 Math.max(10,0,10) 重算出来，默认表被掏空也能过。
+    // 这里锁定只有默认表才提供的字段。
+    assert.equal(d.delegateBudget, 20, "默认表必须完整（委托池默认额度）");
+    assert.equal(d.invCap, 15, "默认表必须完整（侦查池额度）");
+    assert.deepEqual(d.rejectedCmds, {}, "默认表必须完整（已否决命令表）");
     const weird = "../x/..\\a b:c";
     run("reset", { session_id: weird, prompt: "看看情况" });
     const san = weird.replace(/[^A-Za-z0-9._-]/g, "_");
-    const s = JSON.parse(readFileSync(join(tmpdir(), `focus-guard-${san}-${RUN}.json`), "utf8"));
-    assert.equal(s.taskBudget, 10); // 消毒后正常读写，无路径穿越
+    const found = readdirSync(tmpdir()).filter((f) => f.startsWith(`focus-guard-${san}`) && f.includes(RUN) && f.endsWith(".json"));
+    assert.equal(found.length, 1, "消毒后的状态文件应恰好一个");
+    assert.equal(JSON.parse(readFileSync(join(tmpdir(), found[0]), "utf8")).taskBudget, 10); // 无路径穿越，正常读写
+    // 2.5.2：消毒撞名——proj/a 与 proj_a 曾是同一个状态文件，熔断/审批/预算会跨会话串味
+    run("reset", { session_id: "proj/a", prompt: "看看情况" });
+    run("reset", { session_id: "proj_a", prompt: "看看情况" });
+    const a = readdirSync(tmpdir()).filter((f) => f.startsWith("focus-guard-proj_a") && f.includes(RUN) && f.endsWith(".json"));
+    assert.equal(a.length, 2, "两个不同会话 ID 必须落成两个状态文件");
   });
 
   test("中文路径：取证、改动前备份全链路可用", () => {
@@ -862,9 +1164,24 @@ describe("极限场景（v2.4.1）", () => {
     for (let i = 1; i <= 6; i++) run("post", { tool_name: "Read", tool_input: { file_path: `g${i}.txt`, limit: 5 }, tool_response: { content: `w${i}` } });
     assert.ok(run("stop", { response: "就这样了" }).out.includes("证据锚点")); // ZCode 载荷照常打回
   });
+
+  test(">200KB 文件：指纹退回 mtime+size+git（SHA 不参与，git 不可用时仅 mtime+size）", () => {
+    const run = makeRunner("big-fp");
+    const dir = freshDir();
+    const big = join(dir, "big.dat");
+    writeFileSync(big, "A".repeat(300 * 1024));
+    const r = run.in(dir);
+    r("reset", { prompt: "看看情况" });
+    r("post", { tool_name: "Read", tool_input: { file_path: big }, tool_response: { content: "A" } });
+    const rec = Object.values(stateOf("big-fp").caseCache)[0];
+    assert.equal(rec.sha, "", ">200KB 不计算 SHA");
+    assert.equal(rec.via, "mtime+size+git");
+    assert.ok([null, 0, 1].includes(rec.gitDirty)); // git 不可用时为 null（降级为 mtime+size）
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
 
-describe("工程自检（v2.5.1：防版本与文档漂移）", () => {
+describe("工程自检（防版本与文档漂移）", () => {
   const ROOT = (p) => fileURLToPath(new URL(p, import.meta.url));
 
   test("版本一致性：五处清单 + ENGINE_VERSION + 引擎头注释完全相同", () => {
@@ -925,5 +1242,71 @@ describe("工程自检（v2.5.1：防版本与文档漂移）", () => {
     assert.ok(rules.includes("经领导回复 y 放行后方可执行"));
     // 空头条款透明化：未机械化清单必须存在
     assert.ok(rules.includes("未机械化条款清单"));
+  });
+
+  test("hooks.json 六条钩子与引擎实现一一对应（防注册名漂移）", () => {
+    const hooks = JSON.parse(readFileSync(ROOT("../hooks/hooks.json"), "utf8"));
+    const guard = readFileSync(GUARD, "utf8");
+    assert.deepEqual(Object.keys(hooks.hooks), [
+      "SessionStart",
+      "UserPromptSubmit",
+      "PreToolUse",
+      "PostToolUse",
+      "PostToolUseFailure",
+      "Stop",
+    ]);
+    for (const [ev, groups] of Object.entries(hooks.hooks)) {
+      for (const g of groups) {
+        for (const h of g.hooks) {
+          assert.equal(h.type, "command", `${ev} 钩子类型应为 command`);
+          const m = String(h.command).match(/guard\.mjs"?\s+(\w+)/);
+          assert.ok(m, `${ev} 的命令未指向 guard.mjs 子命令`);
+          assert.ok(guard.includes(`mode === "${m[1]}"`), `${ev} -> mode "${m[1]}" 引擎无实现`);
+        }
+      }
+    }
+  });
+
+  test("RULES 第四部分 = 引擎真实注入文本（逐字镜像，防文档失真）", () => {
+    const run = makeRunner("inject-mirror");
+    const dir = freshDir();
+    const out = run("start", { session_id: "inject-mirror" }, { ZCODE_PROJECT_DIR: dir }).out;
+    const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+    const injected = ctx.split("\n【")[0]; // 引擎在常驻注入后可能追加巡视/版本告警段
+    assert.ok(injected.length > 200, "注入文本提取失败");
+    assert.ok(readFileSync(ROOT("../docs/RULES.md"), "utf8").includes(injected), "RULES 第四部分与真实注入文本不一致");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("会话状态原子落盘：不遗留 .tmp 残片，状态可解析", () => {
+    const run = makeRunner("atomic-state");
+    run("reset", { prompt: "看看情况" });
+    for (let i = 0; i < 5; i++) {
+      run("post", { tool_name: "Read", tool_input: { file_path: `f${i}.txt`, limit: 5 }, tool_response: { content: `v${i}` } });
+    }
+    const leftovers = readdirSync(tmpdir()).filter((f) => f.startsWith(`focus-guard-atomic-state-${RUN}`) && f.endsWith(".tmp"));
+    assert.deepEqual(leftovers, [], "原子落盘不应遗留 .tmp 残片");
+    assert.equal(stateOf("atomic-state").turnCount, 5);
+  });
+
+  test("部署漂移核验：注册表/市场源与引擎不一致 → 注入警告并留痕（此前该分支无覆盖）", () => {
+    const run = makeRunner("deploy-drift");
+    const dir = freshDir();
+    const home = freshDir();
+    mkdirSync(join(home, ".zcode", "cli", "plugins"), { recursive: true });
+    writeFileSync(
+      join(home, ".zcode", "cli", "plugins", "installed_plugins.json"),
+      JSON.stringify({ version: 1, plugins: [{ id: "focus-guard@x", installPath: join(home, "cache", "focus-guard", "1.0.0") }] })
+    );
+    mkdirSync(join(home, ".zcode", "workspace", "default", "plugins", "focus-guard"), { recursive: true });
+    writeFileSync(
+      join(home, ".zcode", "workspace", "default", "plugins", "focus-guard", "marketplace.json"),
+      JSON.stringify({ version: "1.2.0" })
+    );
+    const r = run("start", { session_id: "deploy-drift" }, { ZCODE_PROJECT_DIR: dir, USERPROFILE: home, HOME: home });
+    assert.ok(r.out.includes("部署版本核验"), "应注入部署漂移警告");
+    assert.ok(readFileSync(join(dir, ".focus-guard", "AUDIT.log"), "utf8").includes("deploy-mismatch"));
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
   });
 });

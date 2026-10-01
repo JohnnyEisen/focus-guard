@@ -1,4 +1,4 @@
-# FocusGuard 安装指南（v2.5.1）
+# FocusGuard 安装指南（v2.5.2）
 
 前置要求：Node.js ≥ 18（引擎零依赖，仅用内置模块）。逐行验证：
 
@@ -35,7 +35,7 @@ dir /b marketplace.json
 
 验证生效：新会话开头出现 `<focus-guard AI履职执法模型v3.0 强制生效：日常零打扰，只看行为>` 注入即为生效；工作区出现 `.ai/CASE_FILE.md` 与 `.focus-guard/AUDIT.log` 即为卷宗与留痕就绪。
 
-源码目录内跑验收（63 用例应全绿）：
+源码目录内跑验收（86 用例应全绿；仓库已带 CI，推送即自动跑）：
 
 ```bat
 cd /d <仓库目录>

@@ -1,0 +1,44 @@
+name: CI
+
+# 质量闸：每次推送/PR 都跑验收 + 威胁评测。
+# 在此之前本仓库是"零 CI"状态——README 里的"用例全绿"只靠人工在本地跑过一次，没有任何机制保证。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 验收 (${{ matrix.os }} / Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    # Windows 是开发与验证平台（必过）。
+    # Linux/macOS 暂列为"观察项"：验收用例里仍有数处 Windows shell 检测断言，
+    # 跨平台绿灯需先把这些用例平台化，再把本行去掉转为必过。
+    continue-on-error: ${{ matrix.os != 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        node: ["18.20", "20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 环境信息
+        run: node -v && node -e "console.log(process.platform, process.arch)"
+
+      - name: 验收用例（含版本一致性 / 说明去重 / 文档-实现对齐自检）
+        run: node --test tests/acceptance.test.mjs
+
+      - name: 威胁评测（高危检出率 + 良性误报率，有漏检或误报即失败）
+        run: node tests/threat-eval.mjs hooks/guard.mjs
+
+      - name: 报文基准（仅报表，不作失败判据）
+        run: node tests/token-bench.mjs hooks/guard.mjs

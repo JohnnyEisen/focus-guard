@@ -1,6 +1,6 @@
 {
   "name": "focus-guard",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "description": "FocusGuard 聚焦护栏 · Claude 钩子方言兼容清单（hooks/hooks.json）。DSH 端由官方桥 @deepseek-ai/dsh-hooks-claude-code 直接运行本清单，获得与 ZCode 同级的硬拦截：PreToolUse deny/ask、exit 2 阻断、stderr 原文透传、Stop 打回；本文件供 DSH 兼容层按插件清单查找顺序第 2 位识别。能做什么、阈值多少、怎么排错——以 README.md、INSTALL.md 与仓库根清单为准。",
   "author": {
     "name": "JohnnyEisen",

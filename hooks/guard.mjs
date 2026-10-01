@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// focus-guard 护栏脚本 v2.5.1 — 卷宗体系（总纲 2.0.0）+ 《AI 履职执法模型 v3.0》+ 动态预算
+// focus-guard 护栏脚本 v2.5.2 — 卷宗体系（总纲 2.0.0）+ 《AI 履职执法模型 v3.0》+ 动态预算
 // 一、空气层：不查词、不打扰（违禁词扫描已废除）
 // 二、触发层：行为违规即罚，梯度处罚 L1-L6；触发④=动态预算+进度检测；三预算池(侦查/执行/委托，20条)
 // 三、卷宗层(2.0)：.ai/CASE_FILE.md 四册（环境声明/依赖声明/侦查记录/额度台账）
@@ -33,7 +33,7 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.5.1"; // 42条：部署版本核验基准（须与五处清单及本文件头注释一致，见验收"版本一致性"用例）
+const ENGINE_VERSION = "2.5.2"; // 42条：部署版本核验基准（须与五处清单及本文件头注释一致，见验收"版本一致性"用例）
 // 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
 // 2.0.2 DSH 版：csproj/sln 列入风险文件备案（C# 项目配置与 package.json 同级）
 // 2.2.0 正面指引版：git push 人类专属闸（二.3/五.3，本地 commit AI 可做、推送人类 UI 执行）
@@ -51,6 +51,16 @@ const ENGINE_VERSION = "2.5.1"; // 42条：部署版本核验基准（须与五�
 //   ②卷宗【一】环境声明落卷（此前仅占位符，人类无从查阅）；③42条源码路径适配"根即插件"布局、
 //   市场源扫描不再写死 default 工作区；④58条路径查重改判"首 token 是路径"，避免 git 警告行误报且不放过裸相对路径；
 //   ⑤委派 KPI 入额度台账并跨阈值提醒一次；⑥版本一致性自检用例（五处清单+引擎号+本头注释）
+// 2.5.2 对抗审查版（两路独立审计后逐条复现修复）：
+//   [P0] 熔断期白名单先 exit 0，导致 npm publish/shutil.rmtree/reg add 等"不在变更表里"的高危命令绕过审批——改为白名单前先判高危；
+//   [P1] 中文批示词全部失效（正则用 \b 收尾，JS 的 \b 不认 CJK）——改精确整句匹配；「停止/熔断」批示被同一函数写回 false，止停令无效；
+//   [P1] 高危命令超 300 字符后 y/n 永远匹配不上——比对键改为全量哈希（cmdKey），展示仍截断；
+//   [P1] Stop 的部分打回路径没有一次性保护，可被无限重复触发——加 stopBlocked + stop_hook_active 双重闸，并放宽 DSH 无文本签名判定；
+//   [P1] 变更类判定锚定段首，sudo/xargs 前缀与 cp 被当成"只读侦查"——改为按命令词识别并剥离前缀，补 cp/copy/rsync/sed -i 等；
+//   [P1] 熔断期「查无实据」二次判定、reset 的 shell 重检此前无任何覆盖；quickShellId 把 zsh/sh 一律报成 bash，bash↔zsh 切换永不重检；
+//   [P2] 敏感文件（.env/私钥/凭据）不再复制明文副本进 .ai/backup/；会话状态改原子落盘；损坏状态上 stderr 不再静默；
+//   [P2] SQL 的 WHERE 豁免改为按语句判定；curl 的 -d 与 -D 区分大小写；补 find -delete/rimraf/wget post/Invoke-WebRequest POST；
+//   [P2] 删除只写不读且无上限的 state.seen；备份/台账临时文件加进程号；会话 ID 消毒撞名以短哈希区分；抽查A 文案去掉"随机"（实现是确定性节奏）
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -79,55 +89,124 @@ const AUTH_SEMANTICS_RE = /授权|特赦|赦免|批准|允许|豁免|跳过|绕�
 const DOWNGRADE_MARKERS = /最小复现|复现请求|排查实验|联网证据|外部搜寻|卡点记录|HANDOFF\.md|交接报告/i;
 const EVIDENCE_ANCHORS = /:\d+|日志原文|报错|HANDOFF\.md|交接报告|【假设】|【熔断】/;
 const RISKY_FILE_RE = /(^|\/)(package(-lock)?\.json|[^\/]*\.lock|tsconfig\.json|AGENTS\.md|CLAUDE\.md|Dockerfile|[^\/]*\.env[^\/]*|zcode\.json|[^\/]*\.csproj|[^\/]*\.sln)$|\.github\/|\.zcode-plugin\//i;
-const MUTATING_BASH_RE = /(^|[;&|]\s*)(rm|rmdir|mv|del|rd|git\s+(add|commit|push|pull|merge|rebase|reset|checkout|clean|restore)|npm\s+(install|uninstall|ci)|pip3?\s+(install|uninstall)|yarn\s+(add|remove|install)|pnpm\s+(add|remove|install)|chmod|chown|kill|taskkill|truncate|dd|mkfs|mkdir|touch|Set-Content|Add-Content|Remove-Item|New-Item|Copy-Item|Move-Item)\b/i;
+// 2.5.2：敏感文件（明文密钥与凭据）——改动前不做明文副本，只留痕（.pub 公钥不在此列）
+const SECRET_FILE_RE = /(^|\/)(?:\.env(?:\.[^\/]*)?|\.npmrc|\.netrc|\.git-credentials|\.pgpass|\.htpasswd|id_rsa|id_ed25519|id_ecdsa)$|[^\/]*\.(?:pem|key|pfx|p12|jks)$/i;
+// 2.5.2 变更类命令判定：按"命令词"识别，并剥掉 sudo/env/xargs/时间前缀等外壳。
+// 旧写法（`(^|[;&|]\s*)(rm|mv|…)`）要求命令词紧跟段首，于是 `sudo mv`、`xargs mv`、`cp`（当时根本不在表里）
+// 全被判成"只读侦查"——既绕过触发①（未取证就改），又在熔断期拿到放行。
+const MUTATOR_HEAD_RE = /^(?:rm|rmdir|rd|mv|del|cp|copy|xcopy|robocopy|install|rsync|chmod|chown|kill|taskkill|truncate|mkfs|mkdir|touch|tee|patch|git\s+(?:add|commit|push|pull|merge|rebase|reset|checkout|clean|restore|apply|stash|mv|rm)|npm\s+(?:i|install|ci|uninstall|remove|rm|update|publish)|pnpm\s+(?:add|install|remove|rm|update|publish)|yarn\s+(?:add|install|remove|publish|global)|pip3?\s+(?:install|uninstall)|(?:Set|Add|Remove|New|Copy|Move|Clear)-Content|New-Item|Copy-Item|Move-Item|Remove-Item|Set-ItemProperty|New-ItemProperty|Out-File|sed\s+[^&|;]*-i)\b/i;
+const CMD_PREFIX_RE = /^(?:sudo|doas|time|nohup|nice|env|xargs|start|call|command|builtin)\s+(?:-[^\s]+\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/i;
+function isMutatingBashCmd(cmd) {
+  for (const seg of String(cmd || "").split(/[;&|]+/)) {
+    let s = seg.trim();
+    for (let i = 0; i < 3; i++) {
+      const next = s.replace(CMD_PREFIX_RE, "");
+      if (next === s) break;
+      s = next;
+    }
+    if (MUTATOR_HEAD_RE.test(s)) return true;
+  }
+  return false;
+}
 const FILE_REDIRECT_RE = /(^|\s)>{1,2}(?!\s*&)/;
 const BACKUP_KEEP = 100; // 2.2.0：.ai/backup/ 最大保留份数（超出淘汰最旧）
+let backupSeq = 0; // 2.5.2：备份文件名加进程号+自增序号，避免同一毫秒内两次备份互相覆盖
 const DELEGATE_DEFAULT = 20; // 2.3.0：委托池默认额度（独立于执行池；批示『追加额度』三池各+10）
 // 2.4.0 高危命令特征库（六类：破坏性删除/强制推送与历史覆盖/系统权限与配置篡改/全局依赖安装/对外发送与发布/数据库影响）
-// 即使完全访问（yolo）也须人类实时审批；普通单文件 rm、常规构建不在此列
+// 即使完全访问（yolo）也须人类实时审批；普通单文件 rm、常规构建不在此列。
+// 2.5.2 加固：补别名与长旗标写法（npm i -g / yarn global add / pnpm add -g / rd /s / ri -r /
+//   wget --post-data / Invoke-WebRequest -Method POST / curl -d），并修掉两处误伤
+//   （`--force` 里的字母 r 被当成递归删除；`--dry-run` 只在紧跟子命令时才豁免）。
 const DANGEROUS_PATTERNS = new RegExp([
-  "(?:sudo\\s+)?\\brm\\b[^&|;]*\\s-{1,2}\\w*r",
-  "\\brmdir\\b[^&|;]*/s",
+  // 一、破坏性删除：递归旗标必须是旗标本身（-r/-rf/-fr/-R/--recursive），不再用会命中 --force 里 r 的 "-\\w*r"
+  "(?:sudo\\s+)?\\brm\\b[^&|;]*\\s(?:-[a-zA-Z]*[rR][a-zA-Z]*\\b|--recursive\\b)",
+  "(?:^|[;&|]\\s*)(?:rmdir|rd)\\b[^&|;]*/s",
   "\\bdel\\b[^&|;]*/[fsq]",
   "Remove-Item\\s[^&|;]*-Recurse",
+  "(?:^|[;&|]\\s*)ri\\b[^&|;]*\\s(?:-[a-zA-Z]*[rR][a-zA-Z]*\\b|-Recurse\\b)",
   "shutil\\.rmtree",
+  "\\brmSync\\s*\\([^&|;]*recursive",
+  "\\brmdirSync\\s*\\([^&|;]*recursive",
   "drop\\s+table",
   "drop\\s+database",
   "truncate\\s+table",
-  "git\\s+(?:-{1,2}[A-Za-z-][\\S]*\\s+\\S+\\s+)*push\\b(?!\\s+--dry-run)",
-  "git\\s+reset\\s+[^&|;]*--hard",
-  "git\\s+clean\\s+[^&|;]*-\\w*f",
-  "(?:sudo\\s+)?\\brm\\b\\s+--recursive",
-  "\\brmSync\\s*\\([^&|;]*recursive",
-  "\\brmdirSync\\s*\\([^&|;]*recursive",
+  // 二、系统权限与配置篡改
   "chmod\\s+[^&|;]*\\b777\\b",
   "chmod\\s+-R",
   "\\bchown\\b",
-  "\\breg\\s+add\\b",
-  "\\breg\\s+delete\\b",
-  "\\bnet\\s+user\\b.*\\b(add|delete)\\b",
-  "npm\\s+install\\s+(-g\\b|--global\\b)",
+  "\\breg\\s+(?:add|delete)\\b",
+  "\\bnet\\s+user\\b.*\\b(?:add|delete)\\b",
+  // 三、全局依赖安装：npm/pnpm 的 i|install|add|uninstall 与 -g/--global 任意位置；yarn global 无 -g 也拦
+  "\\b(?:npm|pnpm)\\s+(?:i|install|add|uninstall|remove|rm)\\b[^&|;]*(?:\\s-g(?![\\w-])|\\s--global(?![\\w-]))",
+  "\\byarn\\s+(?:global\\s+(?:add|remove|upgrade)|add\\b[^&|;]*\\s-g(?![\\w-]))",
   "pip3?\\s+install\\s+[^&|;]*(--global|--user)",
   "apt(?:-get)?\\s+install",
   "docker\\s+run\\b[^&|;]*--privileged",
-  "npm\\s+publish",
-  "pnpm\\s+publish",
-  "yarn\\s+publish",
+  // 四、对外发送与发布：--dry-run 不发送，整段内出现即豁免
+  "\\b(?:npm|pnpm|yarn)\\s+publish\\b(?![^&|;]*--dry-run)",
   "docker\\s+push",
   "curl\\b[^&|;]*(-X\\s*POST|--request\\s+POST)",
-  "docker\\s+(system\\s+prune|volume\\s+rm)",
+  "wget\\b[^&|;]*(--post-data|--post-file)",
+  "(?:Invoke-WebRequest|Invoke-RestMethod)\\b[^&|;]*-Method\\s+POST",
+  // 五、系统/容器级破坏
+  "docker\\s+(?:system\\s+prune|volume\\s+rm)",
   "mkfs",
   "format\\s+[a-z]:",
   "diskpart",
   "\\bdd\\s+[^&|;]*of=/dev/",
   "\\bshutdown\\b",
+  "\\bfind\\b[^&|;]*-delete\\b",
+  "\\brimraf\\b",
 ].join("|"), "i");
-const SQL_NOWHERE_RE = /\bdelete\s+from\s+[\w`."]+|\bupdate\s+[\w`."]+\s+set\b/i; // 2.4.0：无 where 的 DELETE FROM / UPDATE...SET（结合全命令无 where 判定）
+const SQL_NOWHERE_RE = /\bdelete\s+from\s+[\w`."]+|\bupdate\s+[\w`."]+\s+set\b/i; // 2.4.0：无 where 的 DELETE FROM / UPDATE...SET
+// 2.5.2：WHERE 豁免按"单条语句"判定——旧写法只要整行任意位置出现 where，就把同行的无 where 删除一并放过。
+function sqlNowhere(cmd) {
+  return String(cmd || "")
+    .split(";")
+    .some((s) => SQL_NOWHERE_RE.test(s) && !/\bwhere\b/i.test(s));
+}
+// 2.5.2：curl 的 -d/--data 必须区分大小写（-D 是 dump 响应头，属只读 GET），故单独用无 /i 的正则
+const CURL_DATA_RE = /curl\b[^&|;]*(\s-d\b|\s--data(?:-raw|-binary|-urlencode)?\b)/;
 const SCRIPT_FILE_RE = /\.(sh|ps1|bat|cmd|py|pl|rb|mjs|cjs|js)$/i; // 2.4.0：脚本包装检测范围
+
+// 2.5.2 git 高危子命令：逐段取 git 调用 → 剥掉 git 全局选项 → 看子命令。
+// 旧写法用前缀组硬凑 "-C/-c + 取值"，遇到 --git-dir=/x、--no-pager、-C= 之类穿插即绕过；且只看首段会漏 `a && git push`。
+// --dry-run（clean 为 -n）在该命令段内任意位置出现即豁免——dry-run 不产生任何不可逆后果。
+const GIT_OPT_WITH_VALUE = /(?:^|\s)(?:-[Cc]|--git-dir|--work-tree|--namespace|--exec-path|--config-env)(?:=\S+|\s+\S+)?/g;
+const GIT_OPT_VALUELESS = /(?:^|\s)(?:--no-pager|--paginate|--bare|--literal-pathspecs|--no-replace-objects|--no-optional-locks)\b/g;
+function gitHighRisk(cmd) {
+  for (const seg of String(cmd || "").split(/[;&|]+/)) {
+    const m = seg.match(/\bgit\b([\s\S]*)$/i);
+    if (!m) continue;
+    const rest = m[1].replace(GIT_OPT_WITH_VALUE, " ").replace(GIT_OPT_VALUELESS, " ").trim();
+    if (/^push\b/i.test(rest)) {
+      if (!/--dry-run\b/i.test(rest)) return true;
+      continue;
+    }
+    if (/^reset\b/i.test(rest)) {
+      if (/--hard\b/i.test(rest)) return true;
+      continue;
+    }
+    if (/^clean\b/i.test(rest)) {
+      const force = /(?:^|\s)-[a-zA-Z]*f[a-zA-Z]*\b|--force\b/i.test(rest);
+      const dry = /(?:^|\s)-[a-zA-Z]*n[a-zA-Z]*\b|--dry-run\b/i.test(rest);
+      if (force && !dry) return true;
+    }
+  }
+  return false;
+}
+
+// 2.5.2：审批/否决的比对键改用内容哈希。旧写法把命令截断到 300 字符再与原文比对，
+// 于是超过 300 字符的命令永远等不到匹配——人类按 y 白按（highRiskOk 被消耗但仍不匹配）、
+// 按 n 也存不进 rejectedCmds（"彻底阻断"静默失效）。显示文本仍截断，比对用全量哈希。
+function cmdKey(s) {
+  return createHash("sha256").update(String(s)).digest("hex").slice(0, 24);
+}
+
 function isDangerousCmd(cmd) {
   const c = String(cmd || "");
-  if (/git\s+push\b(?!\s+--dry-run)/i.test(c)) return true;
-  return DANGEROUS_PATTERNS.test(c) || (SQL_NOWHERE_RE.test(c) && !/\bwhere\b/i.test(c));
+  if (gitHighRisk(c)) return true;
+  return DANGEROUS_PATTERNS.test(c) || sqlNowhere(c) || CURL_DATA_RE.test(c);
 }
 
 const DOWNGRADE_MSG =
@@ -159,7 +238,11 @@ function sessionId(input) {
     process.env.CLAUDE_SESSION_ID ||
     process.env.ZCODE_SESSION_ID ||
     "default";
-  return String(id).replace(/[^A-Za-z0-9._-]/g, "_");
+  const raw = String(id);
+  const safe = raw.replace(/[^A-Za-z0-9._-]/g, "_");
+  // 2.5.2：消毒会撞名（proj/a 与 proj_a → 同一状态文件，熔断/审批/预算跨会话串味）。
+  // 仅当发生替换时追加短哈希；正常 id 保持原样，不影响既有状态文件。
+  return safe === raw ? safe : safe + "-" + createHash("sha256").update(raw).digest("hex").slice(0, 8);
 }
 
 function statePath(id) {
@@ -228,8 +311,15 @@ function backupBeforeEdit(absPath) {
     if (!st.isFile() || st.size > SHA_LIMIT) return;
     const rel = relative(dir, absPath);
     if (!rel || rel.startsWith("..")) return;
+    // 2.5.2 敏感文件不落明文副本：.env/私钥/凭据一旦复制进 .ai/backup/，等于在工作区里多留若干份明文密钥。
+    // 跳过备份并留痕 + 明确告知，避免 AI 误以为存在可回滚副本。
+    if (SECRET_FILE_RE.test(normalize(absPath))) {
+      audit(sid, "backup-skip-secret", { level: null, evidence: `敏感文件不落明文副本 ${rel}（回滚请用版本控制）` });
+      process.stderr.write(`[备份跳过]${rel} 属敏感文件，不复制明文副本；回滚请用版本控制。\n`);
+      return;
+    }
     const root = join(dir, ".ai", "backup");
-    const dest = join(root, rel + "." + Date.now().toString(36) + ".bak");
+    const dest = join(root, rel + "." + Date.now().toString(36) + process.pid.toString(36) + (backupSeq++).toString(36) + ".bak");
     mkdirSync(dirname(dest), { recursive: true });
     copyFileSync(absPath, dest);
     const all = [];
@@ -253,9 +343,11 @@ function loadState(path) {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
   } catch {
+    // 2.5.2：文件在但解析失败 = 熔断/已否决命令/审批标记全部清零，属"状态层面的假留痕"，
+    // 必须让人类看见（与 2.5.1 的留痕防线同源）。首次运行无文件属正常，不告警。
+    if (existsSync(path)) noteFail(sid, "会话状态损坏（已按默认值继续：熔断、已否决命令、审批标记全部丢失）");
     return {
       turnCount: 0,
-      seen: {},
       fused: false,
       stopBlocked: false,
       dumpCount: 0,
@@ -282,7 +374,8 @@ function loadState(path) {
       pollutionFlagged: false,
       goalPush: false, // 2.4.0：目标预授权（仅记录，不解锁执行）
       highRiskOk: false, // 2.4.0：执行级授权（仅当回合人类短指令 y/同意 可设置）
-      highRiskCmd: "", // 2.4.0：待批/已批的高危命令原文（逐字一致校验基准）
+      highRiskCmd: "", // 2.4.0：待批/已批的高危命令原文（显示与审计用，>300 字符截断展示）
+      highRiskKey: "", // 2.5.2：待批/已批命令的全量哈希（比对与"已否决"登记用，不受截断影响）
       highRiskDeniedThisTurn: false, // 2.4.0：本回合发生过高危拒绝（收尾须带审批单）
       rejectedCmds: {}, // 2.4.0：被人类 n 否决的命令（彻底阻断）
       scriptFiles: {}, // 2.4.0：写入过的脚本文件 → 内容是否含高危命令（绕行检测）
@@ -299,7 +392,18 @@ function loadState(path) {
 }
 
 function saveState(path, state) {
-  writeFileSync(path, JSON.stringify(state));
+  // 2.5.2 原子落盘：先写同目录临时文件再 rename 覆盖。原直接 writeFileSync 在进程被中断时
+  // 会留下半截 JSON（loadState 只能静默降级为默认值，等于整个会话状态凭空消失）。
+  const tmp = path + "." + process.pid + ".tmp";
+  try {
+    writeFileSync(tmp, JSON.stringify(state));
+    renameSync(tmp, path);
+  } catch {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {}
+    noteFail(sid, "会话状态落盘（本次状态未保存，熔断/预算计数可能回退）");
+  }
 }
 
 function normalize(p) {
@@ -311,12 +415,16 @@ function normalize(p) {
 function quickShellId() {
   if (process.platform === "win32") {
     const sh = String(process.env.SHELL || "");
-    if (/bash|zsh|sh\b/i.test(sh)) return "bash";
+    // 2.5.2：分别识别，别把 zsh/sh 一律报成 bash——旧写法 /bash|zsh|sh\b/ 命中后硬返回 "bash"，
+    // 于是 bash↔zsh 之间的切换在总纲三的"shell 变化才重检"里永远检测不到。
+    if (/bash/i.test(sh)) return "bash";
+    if (/zsh/i.test(sh)) return "zsh";
+    if (/(^|[\\/])sh(\.exe)?$/i.test(sh)) return "sh";
     // 2.0.1 修复：PSModulePath 系统级恒存（Windows PowerShell 5.0 起写入机器环境），
     // 不足以证明当前是 PowerShell 会话；仅认 pwsh7 特征路径 / ComSpec 指向 PowerShell。
     // 其余一律落 cmd/unknown → 不启用平台禁令（误判宁宽勿严，避免堵死 Git Bash 工作流）。
     const psm = String(process.env.PSModulePath || "");
-    if (/Program Files[\\/]+PowerShell/i.test(psm)) return "powershell";
+    if (/Program Files[\\/]+PowerShell[\\/]+\d/i.test(psm) || /windowsapps[\\/]+microsoft\.powershell/i.test(psm)) return "powershell";
     const cs = String(process.env.ComSpec || "");
     if (/powershell/i.test(cs)) return "powershell";
     return cs.toLowerCase().includes("cmd") ? "cmd" : "unknown";
@@ -459,7 +567,7 @@ function saveCaseRecords(projDir, records) {
       )
       .join("\n");
     t = t.replace(/(### 【三】[\s\S]*?\n)\| 文件名 \|[\s\S]*?(?=\n### |\n## |$)/, (_m, head) => head + table + "\n");
-    const tmp = p + ".tmp";
+    const tmp = p + "." + process.pid + ".tmp";
     writeFileSync(tmp, t);
     renameSync(tmp, p);
   } catch {
@@ -477,7 +585,7 @@ function saveLedger(projDir, state) {
     const row = `| ${new Date().toISOString().slice(0, 16)} | ${state.taskInitial ?? state.taskBudget ?? BUDGET_DEFAULT} | ${used} | ${Math.max(0, (state.taskBudget || BUDGET_DEFAULT) - used)} | ${eff} | ${state.ineffCalls || 0} | ${new Date().toISOString()} | KPI ${state.kpi || 0} |`;
     const table = ["| 任务 | 初始额度 | 已用额度 | 剩余额度 | 有效调用 | 无效调用 | 更新时间 | KPI |", "|---|---|---|---|---|---|---|---|", row].join("\n");
     t = t.replace(/### 【四】[\s\S]*?(?=\n### |\n## |$)/, () => "### 【四】工作额度台账\n\n" + table + "\n");
-    const tmp = p + ".tmp";
+    const tmp = p + "." + process.pid + ".tmp";
     writeFileSync(tmp, t);
     renameSync(tmp, p);
   } catch {
@@ -557,7 +665,7 @@ function isMutating(tool, ti, handoff) {
   if (tool === "Write" || tool === "Edit") return !handoff;
   if (tool === "Bash") {
     const cmd = String(ti.command || "");
-    return MUTATING_BASH_RE.test(cmd) || FILE_REDIRECT_RE.test(cmd);
+    return isMutatingBashCmd(cmd) || FILE_REDIRECT_RE.test(cmd);
   }
   return false;
 }
@@ -567,7 +675,7 @@ function isInvestigation(tool, ti) {
   if (/mcp__.*(web|search)/i.test(tool)) return true;
   if (tool === "Bash") {
     const cmd = String(ti.command || "");
-    return !MUTATING_BASH_RE.test(cmd) && !FILE_REDIRECT_RE.test(cmd);
+    return !isMutatingBashCmd(cmd) && !FILE_REDIRECT_RE.test(cmd);
   }
   return false;
 }
@@ -751,7 +859,6 @@ if (mode === "reset") {
     state.violations = Math.max(state.violations || 0, 3);
     audit(sid, "stall-fuse", { level: 3, evidence: "人类批示停止" });
   }
-
   // 24条(三) 追加批示：明示追加 → 执行池/侦查池/委托池各+10
   if (short.length <= 12 && /追加|增加额度|扩大额度/.test(short)) {
     state.taskBudget = Math.min((state.taskBudget || BUDGET_DEFAULT) + REFILL, BUDGET_CAP);
@@ -761,18 +868,23 @@ if (mode === "reset") {
     audit(sid, "budget-extend", { level: null, evidence: `24条(三) 追加批示 budget=${state.taskBudget} invCap=${state.invCap} delegate=${state.delegateBudget}` });
   }
 
-  // 2.4.0 二.3/4：实时审批——执行级授权只认人类当回合短指令：y 放行本次，n 彻底阻断
-  const yReply = short.length <= MERCY_SHORT && /^(y|yes|是|好|行|ok|同意|批准|允许|可以|没问题|通过)\b/i.test(short);
-  const nReply = short.length <= MERCY_SHORT && /^(n|no|不|不行|否|不要|拒绝|不许)\b/i.test(short);
-  if (yReply && state.highRiskCmd) {
+  // 2.4.0 二.3/4：实时审批——执行级授权只认人类当回合短指令：y 放行本次，n 彻底阻断。
+  // 2.5.2 修：①原正则以 \b 收尾，而 JS 的 \b 只认 ASCII 词字符，导致「同意/批准/不/拒绝」等中文批示全部失效
+  //            （整个产品的操作界面是中文，按"同意"却一直待批、按"不"却不阻断）；改为"整条短指令就是一个批示词
+  //            +可有尾标点"的精确匹配，顺带避免"是不是应该…"这类句子被误判成 y。
+  //            ②比对键改用全量哈希（见 cmdKey）：超过 300 字符的命令此前永远等不到 y/n 匹配。
+  const yReply = short.length <= MERCY_SHORT && /^(?:y|yes|是|好|行|ok|同意|批准|允许|可以|没问题|通过)[\s。！!，,]*$/i.test(short);
+  const nReply = short.length <= MERCY_SHORT && /^(?:n|no|不|不行|否|不要|拒绝|不许)[\s。！!，,]*$/i.test(short);
+  if (yReply && state.highRiskKey) {
     state.highRiskOk = true;
     audit(sid, "high-risk-approved", { level: null, evidence: `批示原文: ${short} | 待批: ${String(state.highRiskCmd).slice(0, 100)}`, pardon: true });
   }
-  if (nReply && state.highRiskCmd) {
+  if (nReply && state.highRiskKey) {
     state.rejectedCmds = state.rejectedCmds || {};
-    state.rejectedCmds[String(state.highRiskCmd)] = 1;
+    state.rejectedCmds[String(state.highRiskKey)] = 1;
     audit(sid, "high-risk-rejected", { level: null, evidence: `批示原文: ${short} | 已彻底阻断: ${String(state.highRiskCmd).slice(0, 100)}` });
     state.highRiskCmd = "";
+    state.highRiskKey = "";
   }
 
   // 43条 状态重置核验：上一回合残留 → 记档报告后清理（本事件随后统一重置）
@@ -793,14 +905,15 @@ if (mode === "reset") {
   saveState(path, {
     ...state, // envCache/caseCache（侦查缓存）随 spread 保留；kpi/delegateUsed（考核与委托台账）跨回合保留
     turnCount: 0,
-    seen: {},
-    fused: false,
+    // 2.5.2：人类批示"停/熔断"必须真的生效。旧代码在此把 fused 硬写回 false、violations 清零，
+    // 同一个函数前面刚设的止停令被自己抹掉——只有一行 AUDIT 记录，熔断等于没下。
+    fused: stopOrdered,
     stopBlocked: false,
     mercy,
     goalPush, // 2.4.0：目标预授权仅记录，不构成执行级授权
-    highRiskOk: yReply && !!state.highRiskCmd, // 2.4.0：执行级授权只认当回合人类短指令
+    highRiskOk: yReply && !!state.highRiskKey, // 2.4.0：执行级授权只认当回合人类短指令
     highRiskDeniedThisTurn: false,
-    violations: 0,
+    violations: stopOrdered ? Math.max(state.violations || 0, 3) : 0,
     forcedInvestigate: false,
     probation: false,
     readSet: {},
@@ -886,6 +999,14 @@ if (mode === "pre") {
 
   // 触发⑤：熔断期白名单——只读调查类 + 降级动作放行，改动类拒绝（L3 放行只读工具）
   if (state.fused) {
+    // 2.5.2 [P0] 熔断期不是高危命令的免检通道。旧顺序让白名单先 exit 0，于是
+    // npm publish / shutil.rmtree / reg add / diskpart 等"不在 MUTATING 表里"的高危命令
+    // 被 isInvestigation 判成只读侦查，直接绕过审批——"即使完全访问也须实时审批"的不变量在熔断期失效。
+    if (tool === "Bash" && isDangerousCmd(String(ti.command || ""))) {
+      audit(sid, "deny-shuanggui-highrisk", { level: 3, evidence: `熔断期高危命令被拒 ${String(ti.command).slice(0, 120)}` });
+      process.stderr.write("[熔断期·高危命令]熔断期只读放行不含高危命令。此类命令即使解熔也须走【高危申请】审批，现在一律拒绝。\n");
+      process.exit(2);
+    }
     if (search || handoff || isInvestigation(tool, ti)) process.exit(0);
     audit(sid, "deny-shuanggui", { level: 3, evidence: `${tool} 熔断期改动类被拒` });
     process.stderr.write(DOWNGRADE_MSG);
@@ -913,17 +1034,19 @@ if (mode === "pre") {
       .map((t) => normalize(t))
       .filter((t) => (state.scriptFiles || {})[t] === "d");
     if (isDangerousCmd(cmdStr) || scriptHits.length) {
-      if ((state.rejectedCmds || {})[cmdStr]) {
+      if ((state.rejectedCmds || {})[cmdKey(cmdStr)]) {
         audit(sid, "high-risk-rejected", { level: null, evidence: `2.4.0 已否决命令再次尝试 ${cmdStr.slice(0, 120)}` });
         process.stderr.write("[高危命令闸·已否决]该命令已被人类批示 n，彻底阻断。如需变体，重新走【高危申请】。");
         process.exit(2);
       }
-      if (state.highRiskOk && state.highRiskCmd === cmdStr) {
+      if (state.highRiskOk && state.highRiskKey === cmdKey(cmdStr)) {
         state.highRiskOk = false; // 放行本次（一次性）
         state.highRiskCmd = "";
+        state.highRiskKey = "";
         saveState(path, state);
         audit(sid, "high-risk-executed", { level: null, evidence: `2.4.0 已批高危命令执行 ${cmdStr.slice(0, 120)}` });
       } else if (state.highRiskDeniedThisTurn && scriptHits.length) {
+        state.violations = Math.max(state.violations || 0, 3); // 16条：对抗审查从重，至少落在 L4 记档
         const level = penalize(state, sid, "violation-wrap-bypass", `2.4.0 脚本包装绕过 ${scriptHits.join(",").slice(0, 80)}`);
         saveState(path, state);
         process.stderr.write(
@@ -932,6 +1055,7 @@ if (mode === "pre") {
         process.exit(2);
       } else {
         state.highRiskCmd = cmdStr.slice(0, 300);
+        state.highRiskKey = cmdKey(cmdStr);
         state.highRiskDeniedThisTurn = true;
         saveState(path, state);
         audit(sid, "high-risk-request", { level: null, evidence: `2.4.0 高危命令待批 ${cmdStr.slice(0, 120)}` });
@@ -947,13 +1071,15 @@ if (mode === "pre") {
   if (/^(Write|Edit)$/.test(tool) && !handoff && filePath && SCRIPT_FILE_RE.test(filePath)) {
     const body = String(ti.content ?? "") + String(ti.new_string ?? "");
     if (isDangerousCmd(body)) {
-      const key = ("write:" + filePath).slice(0, 300);
-      if (state.highRiskOk && state.highRiskCmd === key) {
+      const key = cmdKey("write:" + filePath); // 2.5.2：脚本写入路径也改用全量哈希比对
+      if (state.highRiskOk && state.highRiskKey === key) {
         state.highRiskOk = false;
         state.highRiskCmd = "";
+        state.highRiskKey = "";
         saveState(path, state);
         audit(sid, "high-risk-executed", { level: null, evidence: `2.4.0 已批高危脚本写入 ${filePath}` });
       } else if (state.highRiskDeniedThisTurn) {
+        state.violations = Math.max(state.violations || 0, 3); // 16条：对抗审查从重，至少落在 L4 记档
         const level = penalize(state, sid, "violation-wrap-bypass", `2.4.0 脚本包装绕过(写入) ${filePath}`);
         saveState(path, state);
         process.stderr.write(
@@ -961,7 +1087,8 @@ if (mode === "pre") {
         );
         process.exit(2);
       } else {
-        state.highRiskCmd = key;
+        state.highRiskCmd = ("write:" + filePath).slice(0, 300);
+        state.highRiskKey = key;
         state.highRiskDeniedThisTurn = true;
         saveState(path, state);
         audit(sid, "high-risk-request", { level: null, evidence: `2.4.0 高危脚本写入待批 ${filePath}` });
@@ -1095,9 +1222,7 @@ if (mode === "post" || mode === "postfail") {
   let reason = null;
 
   state.turnCount = (state.turnCount || 0) + 1;
-  const hash = callHash(input);
-  state.seen = state.seen || {};
-  state.seen[hash] = (state.seen[hash] || 0) + 1;
+  // 2.5.2：删除只写不读且无上限的 state.seen（去重信号实际由 lastSig/lastInput 承担，该表只涨不用）
 
   const tool = input.tool_name || "";
   const ti = input.tool_input || {};
@@ -1311,7 +1436,7 @@ if (mode === "post" || mode === "postfail") {
     }
   }
 
-  // 抽查A：每 5 次写操作随机全量审计 1 次
+  // 抽查A：每 5 次写操作全量审计 1 次（确定性节奏，不是随机抽样——原文案写"随机"与实现不符）
   if (!reason && mode === "post" && (tool === "Write" || tool === "Edit")) {
     state.writeOps = (state.writeOps || 0) + 1;
     if (state.writeOps % RANDOM_AUDIT_EVERY === 0) {
@@ -1333,7 +1458,12 @@ if (mode === "stop") {
     .find((v) => typeof v === "string");
   // 2.5.0：DSH 桥接签名（dsh-hooks-claude-code 的 Stop 载荷 transcript_path 恒为空串且无收尾文本）。
   // 该平台 Stop 打回会强制续跑且桥接无连败上限，无文本可校验时锚点/审批单打回降级为仅审计，防死循环。
-  const dshBridge = input.transcript_path === "" && respText === undefined;
+  // 2.5.2：签名判定放宽到"无收尾文本 且 transcript_path 缺失或为空串"——旧写法要求严格 === ""，
+  // 载荷若连该键都没有（不同宿主/桥版本）就会被当成 ZCode，打回无限重复。
+  const dshBridge = respText === undefined && (input.transcript_path === "" || input.transcript_path === undefined);
+  // 2.5.2：宿主在"打回后再次触发 Stop"时会带 stop_hook_active=true。这是协议层的一次性信号：
+  // 见到它就不再打回，直接放行收尾，避免任何一条 block 路径变成强制续跑死循环。
+  const stopReentry = input.stop_hook_active === true;
   let text;
   if (respText !== undefined) {
     text = respText;
@@ -1433,23 +1563,29 @@ if (mode === "stop") {
         } catch {}
       }
     }
+    // 2.5.2 一次性打回：声明熔断却缺降级方案时打回一次；二次起仅审计放行，防宿主强制续跑死循环
+    // （DSH 桥接的 Stop 打回会强制续步且无连败上限，本分支此前没有 stopBlocked 保护）。
+    const needDowngradeBlock = formalFuse && !DOWNGRADE_MARKERS.test(text) && !state.stopBlocked && !stopReentry;
+    if (needDowngradeBlock) state.stopBlocked = true;
     state.turnCount = 0;
     saveState(path, state);
-    if (formalFuse && !DOWNGRADE_MARKERS.test(text)) {
-      audit(sid, "reject-no-downgrade", { level: 3, evidence: "声明熔断但缺降级方案" });
+    if (needDowngradeBlock) {
+      audit(sid, "reject-no-downgrade", { level: 3, evidence: "声明熔断但缺降级方案（已打回一次，二次起只审计）" });
       block(DOWNGRADE_MSG);
     }
     process.exit(0);
   }
 
-  // 双规后必须交代
+  // 双规后必须交代（2.5.2：加 stop_hook_active 一次性信号；否则打回→放行→再打回来回震荡）
   if (
     state.fused &&
     !EVIDENCE_ANCHORS.test(text) &&
     !DOWNGRADE_MARKERS.test(text) &&
-    !state.stopBlocked
+    !state.stopBlocked &&
+    !stopReentry
   ) {
     state.stopBlocked = true;
+    state.turnCount = 0;
     saveState(path, state);
     audit(sid, "reject-no-account", { level: 3, evidence: "双规后未交代" });
     block(
@@ -1459,6 +1595,7 @@ if (mode === "stop") {
   }
 
   // 2.4.0 二.2：高危拒绝后收尾必须带标准审批单（格式校验，缺字段即打回）；DSH 桥接无收尾文本 → 降级审计
+  // 2.5.2：补一次性保护——此前该分支没有任何 stopBlocked 守卫，AI 若始终不出审批单会被无限打回（实测 3/3 重复）。
   if (state.highRiskDeniedThisTurn && !dshBridge) {
     const formOk =
       /【高危申请】/.test(text) &&
@@ -1467,10 +1604,11 @@ if (mode === "stop") {
       /影响范围[:：]/.test(text) &&
       /回滚方案[:：]/.test(text) &&
       /允许执行\s*[?？]\s*[（(]y\/n[)）]/.test(text);
-    if (!formOk) {
+    if (!formOk && !state.stopBlocked && !stopReentry) {
+      state.stopBlocked = true;
       state.turnCount = 0;
       saveState(path, state);
-      audit(sid, "reject-no-form", { level: null, evidence: "2.4.0 高危拒绝后未输出标准审批单" });
+      audit(sid, "reject-no-form", { level: null, evidence: "2.4.0 高危拒绝后未输出标准审批单（已打回一次，二次起只审计）" });
       block(`[高危申请缺失]本回合拒绝了高危命令，收尾必须输出标准审批单（一行，禁长篇解释）：${HIGH_RISK_FORM}`);
       process.exit(0);
     }
@@ -1488,6 +1626,7 @@ if (mode === "stop") {
     (state.turnCount || 0) >= 5 &&
     !EVIDENCE_ANCHORS.test(text) &&
     !state.stopBlocked &&
+    !stopReentry &&
     !dshBridge
   ) {
     const tc = state.turnCount;

@@ -4,7 +4,7 @@
     {
       "name": "focus-guard",
       "source": "./",
-      "version": "2.5.1",
+      "version": "2.5.2",
       "description": "四类失控——未取证就改、结论无锚点、整读大文件烧上下文、查无实据硬凑——在这里被变成可机械拦截的行为事件：命中即按 L1 打回 → L2 强制取证 → L3 熔断 → L4 记档 → L5 降权 → L6 上报逐级处置。三预算池管额度，卷宗指纹管防伪，AUDIT.log 管留痕；ZCode 与 DSH 双端均原生硬拦截，零依赖安装。",
       "displayName": "FocusGuard 聚焦护栏",
       "displayName_i18n": {

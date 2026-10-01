@@ -8,7 +8,7 @@
     {
       "name": "focus-guard",
       "source": "./",
-      "version": "2.5.1",
+      "version": "2.5.2",
       "description": "FocusGuard 聚焦护栏 · DSH 入口市场清单。DSH 按市场清单查找顺序命中本文件（.agents/plugins/ → .claude-plugin/ → .cursor-plugin/ → .github/plugin/ → 根目录），ZCode 请改用仓库根 marketplace.json。挂上官方桥后，本插件在 DSH 上与 ZCode 同为硬拦截而非监察留痕；部署三步见 INSTALL.md 第二节，已知平台差异共 7 条。",
       "displayName": "FocusGuard 聚焦护栏"
     }

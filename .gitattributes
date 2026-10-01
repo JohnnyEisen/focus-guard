@@ -1,0 +1,21 @@
+# 换行与文本规范化：仓库内一律 LF，避免 Windows core.autocrlf 造成
+# 每次 git 操作刷 "LF will be replaced by CRLF" 警告与无意义的整文件差异。
+# 本仓库声明支持 Windows / macOS / Linux，文本换行必须确定化。
+* text=auto eol=lf
+
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.txt   text eol=lf
+
+# 二进制/归档：不做换行转换
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.gz    binary
