@@ -1521,11 +1521,16 @@ if (mode === "stop") {
       if (invalid) {
         state.fused = true;
         state.violations = Math.max(state.violations || 0, 3);
+        // 2.5.2：同样加一次性保护——AI 若反复输出不合规的【授权识别】，此前每次 Stop 都会打回。
+        const first = !state.stopBlocked && !stopReentry;
+        if (first) state.stopBlocked = true;
         audit(sid, "violation-usurp-pardon", { level: 3, evidence: invalid });
         saveState(path, state);
-        block(
-          `[越权解释授权·L3]${invalid}。正确：【授权识别】引本回合人类指令原文+法条；未明→【授权待确认】。禁止自行推断。`
-        );
+        if (first) {
+          block(
+            `[越权解释授权·L3]${invalid}。正确：【授权识别】引本回合人类指令原文+法条；未明→【授权待确认】。禁止自行推断。`
+          );
+        }
         process.exit(0);
       }
       state.mercy = true;
