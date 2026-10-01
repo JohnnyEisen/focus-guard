@@ -19,9 +19,9 @@
 //   stop     (Stop)                回合边界 + 锚点核验 + 额度台账落卷
 import {
   readFileSync, writeFileSync, rmSync, statSync, appendFileSync,
-  mkdirSync, existsSync, renameSync, realpathSync, readdirSync,
+  mkdirSync, existsSync, renameSync, realpathSync, readdirSync, copyFileSync,
 } from "node:fs";
-import { join, dirname, sep, basename } from "node:path";
+import { join, dirname, sep, basename, relative } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -33,9 +33,12 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.0.2"; // 42条：部署版本核验基准
+const ENGINE_VERSION = "2.2.0"; // 42条：部署版本核验基准
 // 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
 // 2.0.2 DSH 版：csproj/sln 列入风险文件备案（C# 项目配置与 package.json 同级）
+// 2.2.0 正面指引版：git push 人类专属闸（二.3/五.3，本地 commit AI 可做、推送人类 UI 执行）
+//   + 污染核实闸（三.1，输出矛盾后首个改动类先拦一次，要求先出【污染核实】声明）
+//   + 改动前自动备份 .ai/backup/（一.2，无 .git 工作区的物理回滚依据）+ 熔断出口提示经验固化 PATTERNS.md（六.1）
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -62,13 +65,16 @@ const EVIDENCE_ANCHORS = /:\d+|日志原文|报错|HANDOFF\.md|交接报告|【�
 const RISKY_FILE_RE = /(^|\/)(package(-lock)?\.json|[^\/]*\.lock|tsconfig\.json|AGENTS\.md|CLAUDE\.md|Dockerfile|[^\/]*\.env[^\/]*|zcode\.json|[^\/]*\.csproj|[^\/]*\.sln)$|\.github\/|\.zcode-plugin\//i;
 const MUTATING_BASH_RE = /(^|[;&|]\s*)(rm|rmdir|mv|del|rd|git\s+(add|commit|push|pull|merge|rebase|reset|checkout|clean|restore)|npm\s+(install|uninstall|ci)|pip3?\s+(install|uninstall)|yarn\s+(add|remove|install)|pnpm\s+(add|remove|install)|chmod|chown|kill|taskkill|truncate|dd|mkfs|mkdir|touch|Set-Content|Add-Content|Remove-Item|New-Item|Copy-Item|Move-Item)\b/i;
 const FILE_REDIRECT_RE = /(^|\s)>{1,2}(?!\s*&)/;
+const PUSH_RE = /\bgit\s+(?:-[A-Za-z]\S*\s+)*(?:-c\s+\S+\s+)*push\b/i; // 2.2.0：git push（含 -C/-c 传参），--dry-run 例外
+const BACKUP_KEEP = 100; // 2.2.0：.ai/backup/ 最大保留份数（超出淘汰最旧）
 
 const DOWNGRADE_MSG =
   "[触发⑤·熔断]改动类工具调用已拒绝（只读调查类仍放行）。按优先级给降级方案：" +
   "1.【最小复现】1-3 个最小复现步骤，或按可能性排序的 2-3 个排查实验，交人类执行；" +
   "2.【联网证据】WebSearch/WebFetch 查报错原文/官方文档，只输出原文链接和关键信息，不给修改建议；" +
   "3.【卡点记录】卡点/已查文件/报错详情/已试方案写入 HANDOFF.md，等待一把手批示。" +
-  "未经批示严禁盲猜硬凑改代码。禁止静默，禁止直接结束对话。";
+  "未经批示严禁盲猜硬凑改代码。禁止静默，禁止直接结束对话。" +
+  "解除后按 [环境:OS] [任务:类型] 以后遇到X必须先做Y 的格式，把本次经验追加到 .ai/PATTERNS.md（下次卡点先 Grep 检索复用）。";
 
 const SESSION_RULES =
   "<focus-guard AI履职执法模型v3.0 强制生效：日常零打扰，只看行为> " +
@@ -144,6 +150,36 @@ function projectDir() {
   }
 }
 
+// ============ 2.2.0 正面指引（一.2）：改动前自动备份 ============
+// 回滚按环境自动选：有 .git → git restore；没有 → 本函数产出的 .ai/backup/ 物理副本覆盖还原。
+// 备份改动前的现状，保留最近 BACKUP_KEEP 份（超出淘汰最旧），失败静默（备份不可阻断正常执法）。
+function backupBeforeEdit(absPath) {
+  try {
+    const dir = projectDir();
+    if (!dir) return;
+    const st = statSync(absPath);
+    if (!st.isFile() || st.size > SHA_LIMIT) return;
+    const rel = relative(dir, absPath);
+    if (!rel || rel.startsWith("..")) return;
+    const root = join(dir, ".ai", "backup");
+    const dest = join(root, rel + "." + Date.now().toString(36) + ".bak");
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(absPath, dest);
+    const all = [];
+    (function walk(d) {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const p = join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else all.push([p, statSync(p).mtimeMs]);
+      }
+    })(root);
+    if (all.length > BACKUP_KEEP) {
+      all.sort((a, b) => a[1] - b[1]);
+      for (let i = 0; i < all.length - BACKUP_KEEP; i++) rmSync(all[i][0], { force: true });
+    }
+  } catch {}
+}
+
 function loadState(path) {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
@@ -177,6 +213,7 @@ function loadState(path) {
       envChecked: false,
       caseCache: {},
       taskInitial: BUDGET_DEFAULT,
+      pollutionFlagged: false,
     };
   }
 }
@@ -696,6 +733,21 @@ if (mode === "pre") {
     } catch {}
   }
 
+  // 2.2.0 二.3/五.3：推送到远程属不可逆操作——本地 commit 测试全绿后 AI 可做，推送由人类在 UI 执行。
+  // 当回合人类短指令明示特赦（state.mercy）才放行。
+  if (tool === "Bash" && !state.mercy) {
+    const cmd = String(ti.command || "");
+    if (PUSH_RE.test(cmd) && !/--dry-run\b/.test(cmd)) {
+      audit(sid, "deny-push", { level: null, evidence: `二.3 推送闸 ${cmd.slice(0, 100)}` });
+      process.stderr.write(
+        "[不可逆·推送闸]推送到远程由人类在 UI 执行，AI 只准备不推送：" +
+          "本地 commit（测试全绿后可自行执行）就绪后，输出一行【提交申请】修改:<文件> (+n,-m) | 测试:n/n 绿 | 允许提交？(y/n)，" +
+          "等人类批示或自行点推送。确需代推：先获人类明示批示（短指令特赦）再重试。"
+      );
+      process.exit(2);
+    }
+  }
+
   if (tool === "Agent") {
     // 48条 子代理继承留痕：父会话处分状态随派单记录（平台无注入通道，以留痕方式移交）
     audit(sid, "subagent-spawn", {
@@ -725,6 +777,19 @@ if (mode === "pre") {
   }
 
   const mutating = isMutating(tool, ti, handoff);
+
+  // 2.2.0 三.1：污染核实闸——上轮工具输出与指令参数矛盾且未核实前，首个改动类先拦一次（一次性，重试放行）
+  if (state.pollutionFlagged && mutating) {
+    state.pollutionFlagged = false;
+    saveState(path, state);
+    audit(sid, "pollution-gate", { level: null, evidence: `三.1 污染核实 ${tool} ${filePath}` });
+    process.stderr.write(
+      "[污染核实闸]上一轮工具输出曾与指令参数矛盾（已记档，标记可疑）。改动前先输出：" +
+        "【污染核实】上次输出与参数矛盾（预期X，实际Y），我已核对，结论是：<可信/不可信/需重试>。" +
+        "只读核验（Read/Grep）不受限，可先交叉验证再重试本次修改。"
+    );
+    process.exit(2);
+  }
 
   // 触发①：未取证就改（turnCount 为本回合调用数，由 stop 清零）
   if ((state.turnCount || 0) === 0 && mutating) {
@@ -825,6 +890,9 @@ if (mode === "pre") {
       }
     } catch {}
   }
+
+  // 2.2.0 一.2：所有闸通过、本次调用确定执行 → 备份改动前内容到 .ai/backup/（新文件无内容可备份，跳过）
+  if (/^(Write|Edit)$/.test(tool) && !handoff && rawPath) backupBeforeEdit(rawPath);
 
   process.exit(0);
 }
@@ -942,6 +1010,7 @@ if (mode === "post" || mode === "postfail") {
     if (hm) {
       const n = parseInt(hm[1] || hm[2], 10);
       if (n > 0 && outLines.length > n) {
+        state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
         audit(sid, "ctx-pollution", { level: null, evidence: `58条 行数超限 head ${n} → 实际 ${outLines.length} 行 | ${cmd.slice(0, 60)}` });
         reason = `[38条·上下文污染]工具输出与指令矛盾：命令承诺 head ${n} 行，实际返回 ${outLines.length} 行。立即停止使用本次输出，不基于不可信输出继续工作；用带标记的小命令（echo MARK-X）隔离核实，并向人类报告此异常。`;
       }
@@ -954,6 +1023,7 @@ if (mode === "post" || mode === "postfail") {
         if (/[\/\\]/.test(l)) seen.add(l);
       }
       if (dup) {
+        state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
         audit(sid, "ctx-pollution", { level: null, evidence: `58条 路径重复 ${dup.slice(0, 80)} | ${cmd.slice(0, 50)}` });
         reason = `[38条·上下文污染]清单类输出出现不可能的重复路径（${dup.slice(0, 60)}）。立即停止使用本次输出，不基于不可信输出继续工作；用带标记的小命令（echo MARK-X）隔离核实，并向人类报告此异常。`;
       }
