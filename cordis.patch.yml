@@ -1,0 +1,49 @@
+# focus-guard 的 DSH 挂载清单
+# dsh.bundle.patch 指向本文件：安装后 DSH 自动把本补丁并入 profile 层栈，
+# 插件无需手动改 profile 的 cordis.patch.yml（参考 @deepseek-ai/dsh-tool-time 文档）。
+#
+# 平台差异（重要）：DSH 的生命周期钩子是 fire-and-forget——
+#   没有(exit code 2 / decision:block)拦截语义，stdout/stderr 被捕获进告警日志（每流 64KiB）。
+#   因此 focus-guard 在 DSH 上以【监察·留痕模式】运行：全程记 AUDIT.log + 卷宗，
+#   拦截信息出现在告警日志，由人类事后追责；硬拦截请用 ZCode 端。
+#
+# 事件映射（DSH v1 事件名，来源 dsh-hooks 插件文档；ZCode 钩子 → DSH 事件）：
+#   SessionStart       → session/created
+#   UserPromptSubmit   → user/message
+#   PreToolUse         → tool/call
+#   PostToolUse        → tool/result
+#   PostToolUseFailure → agent/error（近似映射：DSH 无工具级失败事件，agent 错误计入停滞）
+#   Stop               → turn/end (when: completed)
+#
+# run 的相对路径以插件根目录为基准（同 dsh-hooks 的 examples/ 约定）。
+# input: 'stdin' = 把完整上下文 JSON 写入命令 stdin，guard.mjs 依赖此通道读取事件载荷。
+
+- id: focus-guard
+  name: focus-guard
+  config:
+    hooks:
+      - on: 'session/created'
+        input: 'stdin'
+        run: 'node hooks/guard.mjs start'
+        timeoutMs: 10000
+      - on: 'user/message'
+        input: 'stdin'
+        run: 'node hooks/guard.mjs reset'
+        timeoutMs: 10000
+      - on: 'tool/call'
+        input: 'stdin'
+        run: 'node hooks/guard.mjs pre'
+        timeoutMs: 10000
+      - on: 'tool/result'
+        input: 'stdin'
+        run: 'node hooks/guard.mjs post'
+        timeoutMs: 10000
+      - on: 'agent/error'
+        input: 'stdin'
+        run: 'node hooks/guard.mjs postfail'
+        timeoutMs: 10000
+      - on: 'turn/end'
+        when: 'completed'
+        input: 'stdin'
+        run: 'node hooks/guard.mjs stop'
+        timeoutMs: 10000
