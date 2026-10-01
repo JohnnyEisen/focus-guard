@@ -520,18 +520,16 @@ describe("DSH 版（v2.0.2，CS2 modding 适配）", () => {
 });
 
 describe("正面指引（v2.2.0）", () => {
-  test("推送闸：git push 拒绝并指引人类 UI 推送；--dry-run 与当回合特赦放行", () => {
+  test("推送闸（v2.4.0）：git push 并入高危特征库须实时审批；--dry-run 放行", () => {
     const run = makeRunner("push-gate");
     run("reset", { prompt: "看看情况" });
     run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
     const r = run("pre", { tool_name: "Bash", tool_input: { command: "git push origin main" } });
     assert.equal(r.rc, 2);
-    assert.ok(r.out.includes("推送闸"));
-    assert.ok(r.out.includes("提交申请"));
+    assert.ok(r.out.includes("高危命令闸"));
+    assert.ok(r.out.includes("【高危申请】"));
+    assert.ok(auditOf("push-gate").includes("high-risk-request"));
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "git push --dry-run origin main" } }).rc, 0);
-    run("reset", { prompt: "【特赦】" });
-    run("post", { tool_name: "Read", tool_input: { file_path: "r2.txt", limit: 5 }, tool_response: { content: "v2" } }); // 特赦不豁免取证纪律
-    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "git push origin main" } }).rc, 0);
   });
 
   test("污染核实闸：输出矛盾检出后首个改动类先拦一次，重试放行", () => {
@@ -664,37 +662,77 @@ describe("子代理委派（v2.3.0）", () => {
 });
 
 describe("高危命令闸（v2.4.0）", () => {
-  test("rm 类：申请 → 人类批准 → 逐字一致放行；改动命令须重新申请；普通 rm 不设卡", () => {
+  test("rm -rf ./dist：拦截 → 审批单格式校验 → y 放行本次（一次性）", () => {
     const run = makeRunner("hr1");
     run("reset", { prompt: "看看情况" });
     run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
-    const r1 = run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf build" } });
+    const r1 = run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf ./dist" } });
     assert.equal(r1.rc, 2);
     assert.ok(r1.out.includes("高危命令闸"));
-    assert.ok(r1.out.includes("高危命令申请"));
-    assert.equal(stateOf("hr1").highRiskCmd, "rm -rf build"); // 待批命令已记录
-    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf build" } }).rc, 2); // 未批示前重试仍拒
-    run("reset", { prompt: "同意" });
-    assert.equal(stateOf("hr1").highRiskOk, true);
-    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v3" } }); // 新回合照常先取证
-    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf build" } }).rc, 0); // 批示后逐字一致 → 放行
+    assert.ok(r1.out.includes("【高危申请】"));
+    assert.equal(stateOf("hr1").highRiskCmd, "rm -rf ./dist");
+    const s1 = run("stop", { response: "就这样了" });
+    assert.ok(s1.out.includes("高危申请缺失")); // 收尾无审批单 → 打回
+    assert.equal(
+      run("stop", { response: "【高危申请】命令：`rm -rf ./dist` | 真实目的：清构建产物 | 影响范围：./dist | 回滚方案：可重建 | 允许执行？(y/n)" }).out,
+      ""
+    ); // 带标准审批单 → 放行收尾
+    run("reset", { prompt: "y" }); // 人类实时批示 y
     assert.ok(auditOf("hr1").includes("high-risk-approved"));
-    const r2 = run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf build2" } });
-    assert.equal(r2.rc, 2); // 改动命令 → 重新申请
-    assert.ok(auditOf("hr1").includes("high-risk-request"));
-    run("reset", { prompt: "看看情况" });
-    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v2" } });
-    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm single.txt" } }).rc, 0); // 普通单文件 rm 不设卡
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v3" } }); // 新回合照常先取证
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf ./dist" } }).rc, 0); // 逐字一致 → 放行
+    assert.ok(auditOf("hr1").includes("high-risk-executed"));
+    assert.equal(stateOf("hr1").highRiskOk, false); // 放行本次（一次性）
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "rm -rf ./dist" } }).rc, 2); // 再跑要重新批
   });
 
-  test("其他高危类（npm publish / del /s）同样须审批；批准语义仅认短指令", () => {
-    const run = makeRunner("hr2");
+  test("n 彻底阻断：被否决命令再试不得放行；常规命令零打扰", () => {
+    const run = makeRunner("hr3");
     run("reset", { prompt: "看看情况" });
     run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "git reset --hard HEAD" } }).rc, 2);
+    run("reset", { prompt: "n" });
+    assert.ok(auditOf("hr3").includes("high-risk-rejected"));
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v4" } });
+    const r = run("pre", { tool_name: "Bash", tool_input: { command: "git reset --hard HEAD" } });
+    assert.equal(r.rc, 2);
+    assert.ok(r.out.includes("已否决"));
+    // 日常零打扰：普通 Read/Grep/Write 完全放行
+    assert.equal(run("post", { tool_name: "Read", tool_input: { file_path: "r2.txt", limit: 5 }, tool_response: { content: "v5" } }).out, "");
+    assert.equal(run("pre", { tool_name: "Grep", tool_input: { pattern: "x", path: ".", output_mode: "content", head_limit: 10 } }).out, "");
+    assert.equal(run("pre", { tool_name: "Write", tool_input: { file_path: "new.txt", content: "hello" } }).out, "");
+    assert.equal(stateOf("hr3").kpi, 0);
+  });
+
+  test("脚本包装绕行：写高危脚本须审批；被拒后当回合执行高危脚本 → 对抗审查 L4", () => {
+    const run = makeRunner("wrap1");
+    run("reset", { prompt: "看看情况" });
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    assert.equal(run("pre", { tool_name: "Write", tool_input: { file_path: "clean.sh", content: "echo hi" } }).rc, 0); // 干净脚本不设卡
+    const d = run("pre", { tool_name: "Write", tool_input: { file_path: "delete.sh", content: "rm -rf ./dist" } });
+    assert.equal(d.rc, 2); // 写高危脚本本身须审批
+    assert.ok(d.out.includes("高危"));
+    assert.ok(auditOf("wrap1").includes("high-risk-request"));
+    writeState("wrap1", { scriptFiles: { "clean.sh": "d" }, highRiskDeniedThisTurn: true });
+    const e = run("pre", { tool_name: "Bash", tool_input: { command: "bash clean.sh" } });
+    assert.equal(e.rc, 2);
+    assert.ok(auditOf("wrap1").includes("violation-wrap-bypass")); // 对抗审查 L4
+  });
+
+  test("预授权隔离：任务里的『上传github』只记 goal 不解锁；其他高危类同样须批", () => {
+    const run = makeRunner("goal1");
+    run("reset", { prompt: "优化结构然后最后上传github" });
+    const s = stateOf("goal1");
+    assert.equal(s.goalPush, true);
+    assert.equal(s.highRiskOk, false);
+    assert.ok(auditOf("goal1").includes("goal-preauth"));
+    run("post", { tool_name: "Read", tool_input: { file_path: "r.txt", limit: 5 }, tool_response: { content: "v" } });
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "git push origin main" } }).rc, 2); // 目标预授权不放行
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "npm publish" } }).rc, 2);
-    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "del /s /q dist" } }).rc, 2);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "npm install -g typescript" } }).rc, 2);
+    assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "curl -X POST https://api.example.com/hook" } }).rc, 2);
     assert.equal(run("pre", { tool_name: "Bash", tool_input: { command: "npm run build" } }).rc, 0); // 常规构建不设卡
-    run("reset", { prompt: "这个问题我们先讨论一下别的，稍后再说" }); // 长句不构成批示
-    assert.equal(stateOf("hr2").highRiskOk, false);
+    run("reset", { prompt: "这个问题我们先讨论一下别的，稍后再说" }); // 长句不构成执行级授权
+    assert.equal(stateOf("goal1").highRiskOk, false);
   });
 });
