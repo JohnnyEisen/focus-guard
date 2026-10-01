@@ -33,7 +33,7 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.4.0"; // 42条：部署版本核验基准
+const ENGINE_VERSION = "2.5.0"; // 42条：部署版本核验基准（2.4.1 时曾漏升引擎号，本轮一并修正）
 // 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
 // 2.0.2 DSH 版：csproj/sln 列入风险文件备案（C# 项目配置与 package.json 同级）
 // 2.2.0 正面指引版：git push 人类专属闸（二.3/五.3，本地 commit AI 可做、推送人类 UI 执行）
@@ -43,6 +43,9 @@ const ENGINE_VERSION = "2.4.0"; // 42条：部署版本核验基准
 //   （【子代理摘要】四字段≤200字，否则拒收）+ 强制委派场景检测（全库搜索/大文档/批量处理，未委派 KPI-5）
 //   + 熔断期启动子代理=越权绕行（L4记档+L5降权）+ 委派 KPI（+5/+3/-5/-3）
 // 2.4.0 高危命令闸：完全访问下 rm 类命令仍须【高危命令申请】+人类批示，批准后逐字一致才放行；放松日常+刚性高危
+// 2.5.0 DSH 硬拦截：官方桥 dsh-hooks-claude-code 直接运行本 hooks.json（exit 2 硬拦/ask 审批/stderr 原文透传），
+//   取代 fire-and-forget 监察模式；Stop 载荷无收尾文本 → 锚点/审批单校验按 DSH 签名降级审计（防桥接续跑死循环）
+// 2.4.1 补记：特征库加固与结构优化时引擎号漏升（manifest 2.4.1 / 引擎 2.4.0 漂移过一个版本），2.5.0 对齐
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -1299,6 +1302,9 @@ if (mode === "stop") {
   const respText = ["response", "last_message", "message", "text", "output"]
     .map((k) => input[k])
     .find((v) => typeof v === "string");
+  // 2.5.0：DSH 桥接签名（dsh-hooks-claude-code 的 Stop 载荷 transcript_path 恒为空串且无收尾文本）。
+  // 该平台 Stop 打回会强制续跑且桥接无连败上限，无文本可校验时锚点/审批单打回降级为仅审计，防死循环。
+  const dshBridge = input.transcript_path === "" && respText === undefined;
   let text;
   if (respText !== undefined) {
     text = respText;
@@ -1410,8 +1416,8 @@ if (mode === "stop") {
     process.exit(0);
   }
 
-  // 2.4.0 二.2：高危拒绝后收尾必须带标准审批单（格式校验，缺字段即打回）
-  if (state.highRiskDeniedThisTurn) {
+  // 2.4.0 二.2：高危拒绝后收尾必须带标准审批单（格式校验，缺字段即打回）；DSH 桥接无收尾文本 → 降级审计
+  if (state.highRiskDeniedThisTurn && !dshBridge) {
     const formOk =
       /【高危申请】/.test(text) &&
       /命令[:：]/.test(text) &&
@@ -1428,13 +1434,19 @@ if (mode === "stop") {
     }
   }
 
+  // 2.5.0：DSH 桥接降级审计（有本应校验的事项时留痕，供人类复核）
+  if (dshBridge && ((state.turnCount || 0) >= 5 || state.highRiskDeniedThisTurn)) {
+    audit(sid, "dsh-stop-observe", { level: null, evidence: `2.5.0 DSH 桥接无收尾文本，锚点/审批单校验降级审计 turnCalls=${state.turnCount || 0} formPending=${!!state.highRiskDeniedThisTurn}` });
+  }
+
   state.unknownStreak = 0;
 
-  // 触发②：本回合调用≥5 且收尾无证据锚点（turnCount 由本事件清零，回合边界不依赖 reset）
+  // 触发②：本回合调用≥5 且收尾无证据锚点（turnCount 由本事件清零，回合边界不依赖 reset）；DSH 桥接降级审计
   if (
     (state.turnCount || 0) >= 5 &&
     !EVIDENCE_ANCHORS.test(text) &&
-    !state.stopBlocked
+    !state.stopBlocked &&
+    !dshBridge
   ) {
     const tc = state.turnCount;
     const level = penalize(state, sid, "violation-no-anchor", `收尾无锚点，本回合 ${tc} 次调用`);
