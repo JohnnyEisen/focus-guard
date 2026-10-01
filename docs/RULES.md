@@ -323,7 +323,7 @@ focus-guard/
 | `prompts/core-discipline.md` | `skills/focus-thinking/SKILL.md`（§7–§8） | 条文镜像，共 64 行 |
 | `README.md` | `README.md` | 已就绪 |
 | — | `.focus-guard/AUDIT.log` | 执法档案（JSONL，表6字段；含 `action` 字段，表6未列，属2.4.1扩充） |
-| — | `tests/acceptance.test.mjs` | 验收 62 用例（含版本一致性/文档-实现对齐自检；另含 threat-eval 对抗评测、token-bench 报文基准） |
+| — | `tests/acceptance.test.mjs` | 验收 63 用例（含版本一致性/五处说明互不重复/文档-实现对齐自检；另含 threat-eval 对抗评测、token-bench 报文基准） |
 
 **实施差异备忘**（引擎相对初版蓝图）：
 

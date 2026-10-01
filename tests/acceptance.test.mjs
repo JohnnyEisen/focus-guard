@@ -887,6 +887,22 @@ describe("工程自检（v2.5.1：防版本与文档漂移）", () => {
     }
   });
 
+  test("清单说明互不重复：五处 description 各自独立（防镜像漂移）", () => {
+    const files = [
+      "../package.json",
+      "../marketplace.json",
+      "../.zcode-plugin/plugin.json",
+      "../.claude-plugin/plugin.json",
+      "../.claude-plugin/marketplace.json",
+    ];
+    const descs = files.map((rel) => {
+      const j = JSON.parse(readFileSync(ROOT(rel), "utf8"));
+      return String(j.description || (j.plugins && j.plugins[0] && j.plugins[0].description) || "").trim();
+    });
+    for (let i = 0; i < files.length; i++) assert.ok(descs[i].length > 0, `${files[i]} description 不得为空`);
+    assert.equal(new Set(descs).size, descs.length, "五处清单 description 必须互不相同（检测到镜像复制）");
+  });
+
   test("文档-实现口径对齐：术语 / 43条处置 / 58条阶段 / 未机械化清单", () => {
     const rules = readFileSync(ROOT("../docs/RULES.md"), "utf8");
     const skill = readFileSync(ROOT("../skills/focus-thinking/SKILL.md"), "utf8");

@@ -9,7 +9,7 @@
       "name": "focus-guard",
       "source": "./",
       "version": "2.5.1",
-      "description": "AI履职执法模型v3.0+动态预算+卷宗体系2.0+正面指引2.2.0+委派条例2.3.0（全自动）：卷宗四册、取证指纹、三预算池(侦查/执行/委托)、污染检测+污染核实闸、L1-L6梯度处罚、高危命令审批单(git push/rm -r 等命中特征库须人类批示,y 放行本次/n 彻底阻断)、改动前自动备份、PATTERNS经验检索、委托池独立核算、子代理摘要强制格式、强制委派场景KPI；兼容层清单：DSH 查找顺序第2位（.claude-plugin/marketplace.json），ZCode 用仓库根 marketplace.json；2.4.0高危命令闸：完全访问下rm类/强推/清盘/删库/发包仍须【高危命令申请】+人类批示，批准后逐字一致才放行；放松日常+刚性高危",
+      "description": "FocusGuard 聚焦护栏 · DSH 入口市场清单。DSH 按市场清单查找顺序命中本文件（.agents/plugins/ → .claude-plugin/ → .cursor-plugin/ → .github/plugin/ → 根目录），ZCode 请改用仓库根 marketplace.json。挂上官方桥后，本插件在 DSH 上与 ZCode 同为硬拦截而非监察留痕；部署三步见 INSTALL.md 第二节，已知平台差异共 7 条。",
       "displayName": "FocusGuard 聚焦护栏"
     }
   ]
