@@ -576,3 +576,89 @@ describe("正面指引（v2.2.0）", () => {
     assert.ok(r.out.includes("PATTERNS.md"));
   });
 });
+
+describe("子代理委派（v2.3.0）", () => {
+  const WIDE_SEARCH = {
+    tool_name: "Bash",
+    tool_input: { command: "find . -name '*.js'" },
+    tool_response: { content: "src/a.js\nsrc/b.js\nsrc/c.js\nlib/d.js\nlib/e.js\ntest/f.js\ntest/g.js\ndocs/h.js\nbin/i.js\nutil/j.js\nutil/k.js\nutil/l.js" },
+  };
+
+  test("场景A 全库搜索不委派 → 未尽职提醒 + KPI-5", () => {
+    const run = makeRunner("del-A");
+    run("reset", { prompt: "全量重构" });
+    const r = run("post", WIDE_SEARCH);
+    assert.ok(r.out.includes("未尽职"));
+    assert.ok(r.out.includes("Agent"));
+    assert.equal(stateOf("del-A").kpi, -5);
+    assert.ok(auditOf("del-A").includes("kpi-not-delegated"));
+  });
+
+  test("场景B 子代理回传超长无格式 → 拒收要求压缩 + KPI-3，不占执行池", () => {
+    const run = makeRunner("del-B");
+    run("reset", { prompt: "看看情况" });
+    const p = run("pre", { tool_name: "Agent", tool_input: { description: "调研依赖" } });
+    assert.equal(p.rc, 0);
+    const r = run("post", { tool_name: "Agent", tool_input: { description: "调研依赖" }, tool_response: { result: "x".repeat(300) } });
+    assert.ok(r.out.includes("拒收"));
+    assert.ok(r.out.includes("压缩"));
+    const s = stateOf("del-B");
+    assert.equal(s.kpi, -3);
+    assert.equal(s.delegateUsed, 1); // 委托池已消耗
+    assert.equal(s.effectiveCalls, 0); // 不占执行池
+    assert.ok(auditOf("del-B").includes("delegate-summary-pollution"));
+  });
+
+  test("场景C 熔断期启动子代理 → 越权绕行 L4记档+L5降权", () => {
+    const run = makeRunner("del-C");
+    run("reset", { prompt: "看看情况" });
+    writeState("del-C", { fused: true });
+    const r = run("pre", { tool_name: "Agent", tool_input: { description: "绕过熔断去改文件" } });
+    assert.equal(r.rc, 2);
+    assert.ok(r.out.includes("越权绕行"));
+    assert.ok(auditOf("del-C").includes("violation-subagent-usurp"));
+    const s = stateOf("del-C");
+    assert.equal(s.probation, true); // L5 降权
+    assert.equal(s.violations, 5);
+    assert.equal(s.fused, true);
+  });
+
+  test("场景D 正常委派 → 放行不计违规，摘要合格+3，强制场景+5", () => {
+    const run = makeRunner("del-D");
+    run("reset", { prompt: "全量重构" });
+    const p = run("pre", { tool_name: "Agent", tool_input: { description: "全库搜索候选" } });
+    assert.equal(p.rc, 0);
+    let s = stateOf("del-D");
+    assert.equal(s.delegateBudget, 19);
+    assert.equal(s.delegateUsed, 1);
+    assert.equal(s.delegated, true);
+    assert.ok(auditOf("del-D").includes("delegate-used"));
+    const good = run("post", {
+      tool_name: "Agent",
+      tool_input: { description: "全库搜索候选" },
+      tool_response: { result: "【子代理摘要】\n任务：定位入口\n结果：main 在 a.js:1\n异常：无\n文件线索：a.js:1" },
+    });
+    assert.equal(good.out, ""); // 合格摘要不打扰
+    s = stateOf("del-D");
+    assert.equal(s.kpi, 3);
+    assert.equal(s.effectiveCalls, 0);
+    const wide = run("post", { ...WIDE_SEARCH, tool_input: { command: "find . -name '*.ts'" }, tool_response: { content: "x/a.ts\nx/b.ts\nx/c.ts\ny/d.ts\ny/e.ts\ny/f.ts\nz/g.ts\nz/h.ts\nz/i.ts\nw/j.ts\nw/k.ts\nw/l.ts" } });
+    assert.equal(wide.out, ""); // 已委派 → 不提醒
+    s = stateOf("del-D");
+    assert.equal(s.kpi, 8); // +3 摘要 +5 委派
+    assert.ok(auditOf("del-D").includes("kpi-delegated"));
+  });
+
+  test("委托池用尽拒绝委派，批示『追加委托额度』+10 后恢复", () => {
+    const run = makeRunner("del-E");
+    run("reset", { prompt: "看看情况" });
+    writeState("del-E", { delegateBudget: 0, delegateUsed: 20 });
+    const r = run("pre", { tool_name: "Agent", tool_input: { description: "第21次委派" } });
+    assert.equal(r.rc, 2);
+    assert.ok(r.out.includes("委托池用尽"));
+    run("reset", { prompt: "追加委托额度" });
+    assert.equal(stateOf("del-E").delegateBudget, 10); // 跨回合保留，批示 +10，不自动回满
+    assert.equal(run("pre", { tool_name: "Agent", tool_input: { description: "第21次委派" } }).rc, 0);
+    assert.equal(stateOf("del-E").delegateUsed, 21);
+  });
+});
