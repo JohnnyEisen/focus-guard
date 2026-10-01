@@ -1,9 +1,12 @@
 {
   "name": "focus-guard",
-  "version": "2.3.0",
-  "description": "AI履职执法模型v3.0+动态预算+卷宗体系2.0+正面指引2.2.0+委派条例2.3.0：双平台护栏（ZCode 原生硬拦截 + DSH 监察留痕）。卷宗四册、取证指纹(SHA-256防伪)、自适应TTL、免重读、双预算池、上下文污染检测+污染核实闸、L1-L6梯度处罚、推送人类专属闸、改动前自动备份、PATTERNS.md经验按需检索、委托池独立核算、子代理摘要强制格式、强制委派场景KPI",
+  "version": "2.4.0",
+  "description": "AI履职执法模型v3.0+动态预算+卷宗体系2.0+正面指引2.2.0+委派条例2.3.0：双平台护栏（ZCode 原生硬拦截 + DSH 监察留痕）。卷宗四册、取证指纹(SHA-256防伪)、自适应TTL、免重读、双预算池、上下文污染检测+污染核实闸、L1-L6梯度处罚、推送人类专属闸、改动前自动备份、PATTERNS.md经验按需检索、委托池独立核算、子代理摘要强制格式、强制委派场景KPI；2.4.0高危命令闸：完全访问下rm类/强推/清盘/删库/发包仍须【高危命令申请】+人类批示，批准后逐字一致才放行；放松日常+刚性高危",
   "license": "MIT",
-  "author": { "name": "JohnnyEisen", "url": "https://github.com/JohnnyEisen" },
+  "author": {
+    "name": "JohnnyEisen",
+    "url": "https://github.com/JohnnyEisen"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/JohnnyEisen/focus-guard.git"
