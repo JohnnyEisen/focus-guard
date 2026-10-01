@@ -201,18 +201,24 @@ description: 防思考失控的聚焦方法。在分析、调研、排查 bug、
 - 该委派时委派 +5；子代理摘要格式完整且 ≤200 字 +3。
 - 该委派却自己扛（主会话膨胀）-5；摘要超长/无格式污染主会话 -3。
 
-## 12. 高危命令审批（v2.4.0：自由与高危的分界线）
+## 12. 高危命令审批（v2.4.0：99% 自由 + 1% 单行审批）
 
-### 12.1 为什么完全访问也要批
-权限模式管平台，护栏管后果。删除、强推、清盘、发布这类动作不可逆——它在放松环境里是唯一必须停下来等人的地方。闸拦的不是 AI 的自由，是"没有人看过的破坏"。
+### 12.1 特征库（六类，即使 yolo/完全访问也拦）
+破坏性删除（rm -r、rmdir /s、del /f、Remove-Item -Recurse、shutil.rmtree、DROP TABLE、TRUNCATE）；强制推送与历史覆盖（**git push**、git reset --hard、git clean -fd）；系统权限与配置（chmod 777、chown、reg add/delete、net user）；全局依赖安装（npm install -g、pip install --global、apt-get install、docker run --privileged）；对外发送与发布（npm publish、docker push、curl -X POST、付费 API 调用）；数据库影响（无 where 的 DELETE/UPDATE、DROP DATABASE）。
 
-### 12.2 高危清单（即使 yolo/完全访问也须审批）
-递归删除（rm -r、del /s、rd /s、Remove-Item -Recurse、rmdir /s）、强推（git push --force）、git clean -f、清盘格式化（mkfs、format x:、diskpart、dd of=/dev/*）、递归改权（chmod -R、icacls /grant）、删库（drop database/table、truncate table）、注册表删除（reg delete）、关机（shutdown）、发包（npm/pnpm/yarn publish）、容器清理（docker system prune、volume rm）。
+### 12.2 审批单（唯一通道，一行，禁长篇解释）
+> 【高危申请】命令：`<真实命令>` | 真实目的：<一句话> | 影响范围：<具体文件/表/系统> | 回滚方案：<可否回滚> | 允许执行？(y/n)
 
-### 12.3 流程（可查证）
-1. 命中 → 引擎拒绝，输出【高危命令申请】：**命令原文 + 目标与影响范围 + 理由**。
-2. 人类批示（同意/批准，短指令）→ **原样重发同一命令**才放行——逐字一致校验，人类批的就是会跑的那条。
-3. 改动命令（哪怕一个字符）→ 重新申请。全程记 AUDIT.log（high-risk-request / high-risk-granted / high-risk-approved）。
+- 命中即拒并要求此单；收尾没带单 → Stop 打回补交（格式缺字段同样打回）。
+- 人类回复 **y**：放行本次（一次性，再跑要重新批）；回复 **n**：该命令彻底阻断，会话内不得重发。
+- 逐字一致校验：人类批的就是会跑的那条命令，改一个字符重新走单。
 
-### 12.4 不设卡的日常
-普通单文件 rm、常规构建与测试命令不走审批——闸只拦不可逆与大规模破坏。放松的日常 + 刚性的高危，是这套护栏的效率来源。
+### 12.3 预授权隔离（防越权）
+- 任务指令里的「最后上传github」只是**目标预授权**（goal=push-at-end），不解锁任何执行。
+- **执行级授权只来自人类当下对审批单的 y/n 短批示**；AI 不得用任务历史/长文本制造授权，插件底层只认当回合短指令。
+
+### 12.4 严禁脚本包装
+高危命令被拒后写个 push.sh/delete.sh 再执行 = 对抗审查。写脚本时内容含高危命令，写入本身就要走审批单；被拒后当回合执行高危脚本 → L4 记档。
+
+### 12.5 不设卡的 99%
+普通单文件 rm、构建、测试、本地 commit、常规 curl GET——零打断。放松日常 + 刚性高危，是这套护栏的效率来源。
