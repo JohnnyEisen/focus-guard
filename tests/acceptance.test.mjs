@@ -278,6 +278,19 @@ describe("体积刺客", () => {
     assert.ok(r.out.includes("体积刺客"));
     rmSync(dir, { recursive: true, force: true });
   });
+
+  test("2.5.3 审计豁免：批示含'审计'时取证对象整读留痕不罚（案二）", () => {
+    const run = makeRunner("audit-read");
+    const dir = freshDir();
+    const big = join(dir, "target.txt");
+    writeFileSync(big, "x".repeat(100 * 1024));
+    run("reset", { prompt: "全面审计这个项目的代码质量" });
+    const r = run("pre", { tool_name: "Read", tool_input: { file_path: big } });
+    assert.equal(r.rc, 0, "审计任务整读取证对象应放行");
+    assert.ok(r.out.includes("审计豁免"));
+    assert.ok(auditOf("audit-read").includes("audit-read-allow"), "豁免必须留痕");
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 describe("高危特征库（v2.5.2 加固：别名/绕行与误伤双向锁定）", () => {
@@ -385,6 +398,17 @@ describe("上下文污染检测（58条）", () => {
     assert.equal(r.out, "");
   });
 
+  test("2.5.3 复合命令分段归因：head 只约束其段，不整段对账（案三）", () => {
+    const run = makeRunner("pollute-compound");
+    run("reset", { prompt: "看看情况" });
+    const r = run("post", {
+      tool_name: "Bash",
+      tool_input: { command: "echo header && git ls-files | head -3 && echo footer" },
+      tool_response: { content: "header\na.js\nb.js\nc.js\nd.js\nfooter" },
+    });
+    assert.equal(r.out, "", "复合命令输出无法按段归因，不得整段对账误报");
+  });
+
   test("清单输出出现重复路径 → 拦截", () => {
     const run = makeRunner("duppath");
     run("reset", { prompt: "看看情况" });
@@ -420,6 +444,16 @@ describe("上下文污染检测（58条）", () => {
 });
 
 describe("回合与部署卫生", () => {
+  test("2.5.3 61条 陈旧清理：30 天未动的临时状态文件在会话启动时被清扫", () => {
+    const stalePath = join(tmpdir(), `focus-guard-staletest-${RUN}.json`);
+    writeFileSync(stalePath, "{}");
+    const old = new Date(Date.now() - 40 * 86400e3);
+    utimesSync(stalePath, old, old); // 伪造为 40 天前未动
+    const run = makeRunner("stale-clean");
+    run("start", { session_id: "stale-clean" });
+    assert.equal(existsSync(stalePath), false, "30 天未动的残留应被清扫");
+    assert.ok(existsSync(join(tmpdir(), `focus-guard-stale-clean-${RUN}.json`)), "当前会话状态不受影响");
+  });
   test("43条 残留核验：上一回合残留被记档后清理", () => {
     const run = makeRunner("residue");
     run("reset", { prompt: "看看情况" });
@@ -518,6 +552,30 @@ describe("卷宗体系（总纲 2.0.0）", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test("2.5.3 卷宗继承指纹只提示不拦：跨会话首读放行，会话内重读仍拦", () => {
+    const run = makeRunner("case-inherit");
+    const dir = freshDir();
+    const f = join(dir, "doc.txt");
+    writeFileSync(f, "v1\n".repeat(10));
+    const st = statSync(f);
+    const recent = new Date(Date.now() - 60e3).toISOString(); // 1 分钟前"别的会话"取证，TTL 4h 未超
+    mkdirSync(join(dir, ".ai"), { recursive: true });
+    writeFileSync(
+      join(dir, ".ai", "CASE_FILE.md"),
+      `# 卷宗\n\n### 【三】侦查取证记录（插件自动追加）\n\n| 文件名 | 读取时间 | mtime | size | SHA-256 | 变更历史 | TTL | 验证方式 |\n|---|---|---|---|---|---|---|---|\n| ${f.replace(/\\/g, "/")} | ${recent} | ${st.mtimeMs} | ${st.size} | - | n=0; last=- | | mtime+size |\n`
+    );
+    const r = run.in(dir);
+    r("start", { session_id: "case-inherit" }, { ZCODE_PROJECT_DIR: dir }); // 继承卷宗指纹
+    const first = r("pre", { tool_name: "Read", tool_input: { file_path: f } });
+    assert.equal(first.rc, 0, "跨会话首读必须放行（案一：内容不在本会话上下文，拦截=阻断取证）");
+    assert.ok(first.out.includes("本会话"), "应有继承提示");
+    r("post", { tool_name: "Read", tool_input: { file_path: f }, tool_response: { content: "v1" } }); // 本会话真读
+    const dup = r("pre", { tool_name: "Read", tool_input: { file_path: f } });
+    assert.equal(dup.rc, 2, "会话内重读仍应免重读拦截");
+    assert.ok(dup.out.includes("免重读"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("时间戳伪造（同 mtime 同 size 换内容）→ SHA-256 揭穿", () => {
     const run = makeRunner("case-forge");
     const dir = freshDir();
@@ -569,8 +627,8 @@ describe("卷宗体系（总纲 2.0.0）", () => {
     const r = run.in(dir);
     r("start", { session_id: "case-dep" }, { ZCODE_PROJECT_DIR: dir });
     const dep = r("pre", { tool_name: "Read", tool_input: { file_path: f } });
-    assert.equal(dep.rc, 2); // 自适应已过期，但依赖声明 60 天仍有效 → 免重读
-    assert.ok(dep.out.includes("依赖声明"));
+    assert.equal(dep.rc, 0); // 2.5.3：卷宗继承指纹只提示不拦（案一），跨会话首读放行
+    assert.ok(dep.out.includes("依赖声明"), "提示应注明 TTL 来源为依赖声明（60天 覆盖自适应，覆盖关系仍生效）");
     rmSync(dir, { recursive: true, force: true });
   });
 

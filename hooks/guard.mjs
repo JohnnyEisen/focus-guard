@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// focus-guard 护栏脚本 v2.5.2 — 卷宗体系（总纲 2.0.0）+ 《AI 履职执法模型 v3.0》+ 动态预算
+// focus-guard 护栏脚本 v2.5.3 — 卷宗体系（总纲 2.0.0）+ 《AI 履职执法模型 v3.0》+ 动态预算
 // 一、空气层：不查词、不打扰（违禁词扫描已废除）
 // 二、触发层：行为违规即罚，梯度处罚 L1-L6；触发④=动态预算+进度检测；三预算池(侦查/执行/委托，20条)
 // 三、卷宗层(2.0)：.ai/CASE_FILE.md 四册（环境声明/依赖声明/侦查记录/额度台账）
@@ -33,7 +33,7 @@ const BUDGET_CAP = 200; // 硬上限：达到强制熔断
 const REFILL = 10; // 自动续杯步长
 const STALL_FUSE = 3; // 连续无效调用 → L3 熔断
 const MERCY_SHORT = 30; // 特赦短语仅认短指令(trim 后 ≤30 字符)，防协议文本误触
-const ENGINE_VERSION = "2.5.2"; // 42条：部署版本核验基准（须与五处清单及本文件头注释一致，见验收"版本一致性"用例）
+const ENGINE_VERSION = "2.5.3"; // 42条：部署版本核验基准（须与五处清单及本文件头注释一致，见验收"版本一致性"用例）
 // 2.0.1 热修：win32 shell 误判（PSModulePath 系统级恒存 → 误判 powershell → 平台禁令堵死 Git Bash 管道）
 // 2.0.2 DSH 版：csproj/sln 列入风险文件备案（C# 项目配置与 package.json 同级）
 // 2.2.0 正面指引版：git push 人类专属闸（二.3/五.3，本地 commit AI 可做、推送人类 UI 执行）
@@ -61,6 +61,13 @@ const ENGINE_VERSION = "2.5.2"; // 42条：部署版本核验基准（须与五�
 //   [P2] 敏感文件（.env/私钥/凭据）不再复制明文副本进 .ai/backup/；会话状态改原子落盘；损坏状态上 stderr 不再静默；
 //   [P2] SQL 的 WHERE 豁免改为按语句判定；curl 的 -d 与 -D 区分大小写；补 find -delete/rimraf/wget post/Invoke-WebRequest POST；
 //   [P2] 删除只写不读且无上限的 state.seen；备份/台账临时文件加进程号；会话 ID 消毒撞名以短哈希区分；抽查A 文案去掉"随机"（实现是确定性节奏）
+// 2.5.3 亲历修复版（依 FG-纪审〔2026〕第1号处理意见书，2026-10-02 领导批示"可"）：
+//   [案一] 卷宗继承指纹只提示不拦——会话启动从卷宗重建的取证记录不再触发免重读拦截
+//          （内容不在本会话上下文，拦首读=阻断取证；会话内真读过后自动恢复拦截）；
+//   [案三] 58条输出对账限单条语句——复合命令（&&/;/换行）里 head 只约束其段，整段对账有六起系统性误报；
+//   [案二] 审计/盘点/审查批示下，取证对象整读留痕不罚（体积闸豁免），预算与巨量输出追责仍生效；
+//   [防线] 卷宗【一】落卷与 PATTERNS.md 创建失败上 stderr（对齐 2.5.1 假留痕防线标准）；
+//   [61条] 会话启动清扫临时目录中 30 天未动的 focus-guard 状态/档案文件（实测残留曾达 8376 个）。
 const INV_POOL_DEFAULT = 15; // 20条：侦查池独立额度（批示可追加）
 const SHA_LIMIT = 200 * 1024; // 总纲四：SHA-256 校验上限（≤200KB）
 const CASE_MAX_ROWS = 200; // 卷宗【三】最大行数（超出淘汰最旧）
@@ -406,6 +413,26 @@ function saveState(path, state) {
   }
 }
 
+// 2.5.3（61条落地）：清理系统临时目录中 30 天未动的 focus-guard 状态/回退档案。
+// 实测残留曾达 8376 个（测试与运行残留无限累积）；30 天未触碰即视为陈旧，会话启动时清扫。
+function cleanStaleTemp(sid) {
+  try {
+    const cutoff = Date.now() - 30 * 86400e3;
+    let cleaned = 0;
+    for (const f of readdirSync(tmpdir())) {
+      if (!/^focus-guard-.*(\.json|-AUDIT\.log)$/.test(f)) continue;
+      const fp = join(tmpdir(), f);
+      try {
+        if (statSync(fp).mtimeMs < cutoff) {
+          rmSync(fp, { force: true });
+          cleaned++;
+        }
+      } catch {}
+    }
+    if (cleaned) audit(sid, "stale-cleaned", { level: null, evidence: `61条 清理 ${cleaned} 个 30 天未动的临时状态/档案文件` });
+  } catch {}
+}
+
 function normalize(p) {
   return String(p || "").replace(/\\/g, "/");
 }
@@ -735,6 +762,7 @@ const path = statePath(sid);
 
 if (mode === "start") {
   rmSync(path, { force: true });
+  cleanStaleTemp(sid); // 2.5.3（61条落地）：清扫临时目录 30 天未动的残留状态/档案
   // 2.0 环境检测：会话级一次，写入 state.envCache（总纲三）
   const env = detectEnv();
   // 2.0 卷宗载入：重建 readSetCache 与 TTL 表（总纲七）
@@ -743,6 +771,9 @@ if (mode === "start") {
   const projDir = projectDir();
   if (projDir) {
     st.caseCache = loadCaseRecords(ensureCaseFile(projDir));
+    // 2.5.3（案一）：会话启动从卷宗重建的取证记录标为"继承"——文件内容并不在本会话上下文中，
+    // 据此免重读拦截会挡住合法首读。继承记录只提示不拦；本会话真读过后（post 重录指纹）自动转正。
+    for (const k of Object.keys(st.caseCache)) st.caseCache[k].inherited = 1;
     try {
       // 2.5.1：卷宗【一】环境声明落卷（此前仅占位符，人类无法查阅——盘点报告半成品项）
       const cp = casePath(projDir);
@@ -750,7 +781,9 @@ if (mode === "start") {
       const envRow = `- OS=${env.os} / Shell=${env.shellIdKey} / 大小写=${env.caseSensitive === false ? "不敏感" : "敏感"} / 编码=${env.encoding || "-"} / 检测于 ${new Date().toISOString()}`;
       t = t.replace(/### 【一】[\s\S]*?(?=\n### |\n## |$)/, () => `### 【一】环境声明（会话级检测，全程复用）\n\n${envRow}\n`);
       writeFileSync(cp, t);
-    } catch {}
+    } catch {
+      noteFail(sid, "卷宗【一】环境声明落卷");
+    }
   }
   saveState(path, st);
   let ctx = SESSION_RULES;
@@ -1150,6 +1183,13 @@ if (mode === "pre") {
     try {
       const kb = Math.round(statSync(rawPath).size / 1024);
       if (kb * 1024 > OUTPUT_GATE_BYTES) {
+        // 2.5.3（案二）：审计/盘点/审查类任务的取证对象整读留痕不罚——法典将审计定为 50 预算
+        // 重大专项，体积闸却拦审计最需要的整读，属制度性误伤。预算与巨量输出追责仍生效。
+        if (/审计|盘点|审查/.test(String(state.turnPrompt || ""))) {
+          audit(sid, "audit-read-allow", { level: null, evidence: `${filePath} ${kb}KB 整读（审计任务豁免，留痕不罚）` });
+          process.stderr.write(`[体积刺客·审计豁免]${filePath} ${kb}KB 整读已留痕（审计任务）。预算仍计费，巨量输出仍追责。`);
+          process.exit(0);
+        }
         const level = penalize(state, sid, "violation-read-gate", `${filePath} ${kb}KB 整读`);
         saveState(path, state);
         process.stderr.write(
@@ -1200,6 +1240,13 @@ if (mode === "pre") {
         if (!changed) {
           const ttl = resolveTTL(pDir, rec, filePath);
           if (Date.now() - (rec.readAt || 0) < ttl.ms) {
+            if (rec.inherited) {
+              // 2.5.3（案一）：卷宗继承的指纹只提示不拦——本会话从未读过，内容不在上下文，
+              // 拦首读即阻断取证。会话内真读过后（post 重录指纹），恢复免重读拦截。
+              audit(sid, "casefile-inherit", { level: null, evidence: `2.0卷宗 继承指纹放行首读 ${filePath} ttl=${ttl.src}` });
+              process.stderr.write(`[卷宗·提示]${filePath} 卷宗有近期取证（${ttl.src}），但本会话尚未读过——首读放行。`);
+              process.exit(0);
+            }
             audit(sid, "casefile-hit", { level: null, evidence: `2.0卷宗 免重读 ${filePath} ttl=${ttl.src}` });
             process.stderr.write(
               `[卷宗·免重读]${filePath} 指纹一致（${rec.via || "mtime+size"}）且 TTL 未超（${ttl.src}），勿重复整读；需新内容用 offset 增量读或请批示。`
@@ -1340,29 +1387,35 @@ if (mode === "post" || mode === "postfail") {
   if (!reason && mode === "post" && tool === "Bash") {
     const cmd = String(ti.command || "");
     const outLines = respText.split("\n").filter((l) => l.trim() !== "");
-    const hm = cmd.match(/\bhead\s+(?:-n\s*(\d{1,6})|-(\d{1,6}))\b/);
-    if (hm) {
-      const n = parseInt(hm[1] || hm[2], 10);
-      if (n > 0 && outLines.length > n) {
-        state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
-        audit(sid, "ctx-pollution", { level: null, evidence: `58条 行数超限 head ${n} → 实际 ${outLines.length} 行 | ${cmd.slice(0, 60)}` });
-        reason = `[38条·上下文污染]输出与指令矛盾：head ${n} 行实得 ${outLines.length}。停用本次输出，echo MARK-X 隔离核实并报告人类。`;
+    // 2.5.3（案三）：输出对账只对"单条语句"有意义——复合命令（&& / ; / 换行分段）里 head 只约束
+    // 其所在段，其余段的输出无法归因，整段对账曾产生六起系统性误报。复合命令跳过本检查，宁宽勿严；
+    // 巨量输出仍有下方"体积刺客"事后追责兜底。管道 | 不分段：一条管道内 head 的承诺对整段输出有效。
+    const stmts = cmd.split(/[;&\n]+/).map((s) => s.trim()).filter(Boolean);
+    if (stmts.length === 1) {
+      const hm = cmd.match(/\bhead\s+(?:-n\s*(\d{1,6})|-(\d{1,6}))\b/);
+      if (hm) {
+        const n = parseInt(hm[1] || hm[2], 10);
+        if (n > 0 && outLines.length > n) {
+          state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
+          audit(sid, "ctx-pollution", { level: null, evidence: `58条 行数超限 head ${n} → 实际 ${outLines.length} 行 | ${cmd.slice(0, 60)}` });
+          reason = `[38条·上下文污染]输出与指令矛盾：head ${n} 行实得 ${outLines.length}。停用本次输出，echo MARK-X 隔离核实并报告人类。`;
+        }
       }
-    }
-    if (!reason && /\b(find|git\s+(ls-files|ls-tree))\b/.test(cmd)) {
-      const seen = new Set();
-      let dup = "";
-      for (const l of outLines) {
-        if (seen.has(l)) { dup = l; break; }
-        // 2.5.1：判定标准为"首 token 本身是路径"（./x/a.js、hooks/guard.mjs、C:\x\y 均算）：
-        // 既排除 git 警告/说明等散文行（首 token 形如 warning:），又不放过 git ls-files 的裸相对路径
-        const tok = l.trim().split(/\s+/)[0] || "";
-        if (/[\/\\]/.test(tok) && !/[:：]$/.test(tok)) seen.add(l);
-      }
-      if (dup) {
-        state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
-        audit(sid, "ctx-pollution", { level: null, evidence: `58条 路径重复 ${dup.slice(0, 80)} | ${cmd.slice(0, 50)}` });
-        reason = `[38条·上下文污染]清单出现不可能的重复路径（${dup.slice(0, 60)}）。停用本次输出，echo MARK-X 隔离核实并报告人类。`;
+      if (!reason && /\b(find|git\s+(ls-files|ls-tree))\b/.test(cmd)) {
+        const seen = new Set();
+        let dup = "";
+        for (const l of outLines) {
+          if (seen.has(l)) { dup = l; break; }
+          // 2.5.1：判定标准为"首 token 本身是路径"（./x/a.js、hooks/guard.mjs、C:\x\y 均算）：
+          // 既排除 git 警告/说明等散文行（首 token 形如 warning:），又不放过 git ls-files 的裸相对路径
+          const tok = l.trim().split(/\s+/)[0] || "";
+          if (/[\/\\]/.test(tok) && !/[:：]$/.test(tok)) seen.add(l);
+        }
+        if (dup) {
+          state.pollutionFlagged = true; // 2.2.0：标记可疑 → 下次改动前须出【污染核实】
+          audit(sid, "ctx-pollution", { level: null, evidence: `58条 路径重复 ${dup.slice(0, 80)} | ${cmd.slice(0, 50)}` });
+          reason = `[38条·上下文污染]清单出现不可能的重复路径（${dup.slice(0, 60)}）。停用本次输出，echo MARK-X 隔离核实并报告人类。`;
+        }
       }
     }
   }
@@ -1565,7 +1618,9 @@ if (mode === "stop") {
               writeFileSync(pat, "# PATTERNS 经验库\n\n> 格式：[环境:OS] [任务:类型] 以后遇到 X 必须先做 Y。熔断/返工后由 AI 追加；新任务不预读，卡点时 Grep 检索（79条）。\n");
             }
           }
-        } catch {}
+        } catch {
+          noteFail(sid, "PATTERNS.md 经验库创建");
+        }
       }
     }
     // 2.5.2 一次性打回：声明熔断却缺降级方案时打回一次；二次起仅审计放行，防宿主强制续跑死循环

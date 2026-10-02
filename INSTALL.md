@@ -1,4 +1,4 @@
-# FocusGuard 安装指南（v2.5.2）
+# FocusGuard 安装指南（v2.5.3）
 
 前置要求：Node.js ≥ 18.17（引擎零依赖，仅用内置模块；与 `package.json` 的 `engines` 一致）。逐行验证：
 
@@ -19,7 +19,7 @@ node -v
 
 ```bat
 :: 1) 取得源码（二选一）
-git clone https://github.com/JohnnyEisen/focus-guard.git
+git clone https://github.com/irisblackwood/focus-guard.git
 :: 或：下载 zip 后解压，得到含 marketplace.json 的目录
 
 :: 2) 验证市场清单位置（必须在仓库根目录，不是子目录）
@@ -50,7 +50,7 @@ npm run check    :: test + eval
 
 ```text
 1) 取得仓库到固定目录（示例 E:\focus-guard-main，git clone 或下载解压）
-   git clone https://github.com/JohnnyEisen/focus-guard.git E:\focus-guard-main
+   git clone https://github.com/irisblackwood/focus-guard.git E:\focus-guard-main
 
 2) 编辑 profile 补丁层（本机 desktop profile 示例）：
    %USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml

@@ -1,6 +1,6 @@
 {
   "name": "focus-guard",
-  "version": "2.5.2",
+  "version": "2.5.3",
   "description": "FocusGuard 聚焦护栏：给 AI 编码智能体（ZCode / DSH 双端原生硬拦截）装上的履职纪律与监察系统。日常零打扰、只查行为；六条钩子覆盖会话启动到收尾全程，含三预算池、L1-L6 梯度处罚与高危命令审批单。零依赖（Node.js ≥18），用法与参数见 README.md。",
   "license": "MIT",
   "engines": {
@@ -12,17 +12,17 @@
     "bench": "node tests/token-bench.mjs hooks/guard.mjs",
     "check": "npm run test && npm run eval"
   },
-  "homepage": "https://github.com/JohnnyEisen/focus-guard#readme",
+  "homepage": "https://github.com/irisblackwood/focus-guard#readme",
   "bugs": {
-    "url": "https://github.com/JohnnyEisen/focus-guard/issues"
+    "url": "https://github.com/irisblackwood/focus-guard/issues"
   },
   "author": {
-    "name": "JohnnyEisen",
-    "url": "https://github.com/JohnnyEisen"
+    "name": "irisblackwood",
+    "url": "https://github.com/irisblackwood"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/JohnnyEisen/focus-guard.git"
+    "url": "https://github.com/irisblackwood/focus-guard.git"
   },
   "keywords": [
     "dsh",
