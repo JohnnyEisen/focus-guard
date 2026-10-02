@@ -1,0 +1,28 @@
+#!/bin/sh
+# FocusGuard 本地质量闸（pre-push）：GitHub Actions 不可用环境下的替代 CI。
+# 推送前强制跑 验收(90用例) + 对抗评测(61高危/34良性)，任一失败即阻止推送。
+# 依 FG-纪审〔2026〕第1号处理意见书落地。启用：git config core.hooksPath .githooks
+# 强行绕过（--no-verify）按法规须先批示——钩子留痕只在正常触发时写入，绕过即失察。
+
+set -u
+cd "$(git rev-parse --show-toplevel)"
+
+log_ci() {
+  mkdir -p .focus-guard 2>/dev/null
+  printf '{"ts":"%s","session":"ci-local","action":"ci-pre-push","trigger":"ci-pre-push","level":null,"evidence":"%s","pardon":false}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" >> .focus-guard/AUDIT.log 2>/dev/null || true
+}
+
+echo "[CI] 本地质量闸启动：npm run check（验收 + 对抗评测）..."
+t0=$(date +%s)
+
+if npm run check; then
+  echo "[CI] 全绿（$(( $(date +%s) - t0 ))s）→ 推送放行。"
+  log_ci "pass" "质量闸全绿（验收90用例+对抗评测61+34），推送放行"
+  exit 0
+fi
+
+echo "[CI] 检查未通过（$(( $(date +%s) - t0 ))s）→ 推送已阻止。" >&2
+echo "[CI] 修复后重试。强行推送（--no-verify）属绕过质量闸，按法规须先批示。" >&2
+log_ci "block" "质量闸未通过，推送阻止"
+exit 1
